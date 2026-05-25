@@ -663,18 +663,42 @@ def _read_tones_from_sloppak(filename: str, dlc: Path) -> list[dict]:
 
 
 def _resolve_song_file(filename: str) -> Path | None:
-    """Return the PSARC/sloppak path inside DLC_DIR, or None if invalid."""
+    """Return the PSARC/sloppak path inside DLC_DIR, or None if invalid.
+
+    Supports both:
+      - Plain basenames ("Reptilia_v1.psarc") — recursively searches the
+        DLC dir for a file with that name. Required for libraries that
+        organise songs in subfolders (by artist, album, etc.).
+      - Relative paths under the DLC dir ("TheStrokes/Reptilia_v1.psarc")
+        — used directly when present.
+
+    Either way the result is path-confined to the DLC tree so an
+    attacker can't escape via "../" in the filename param.
+    """
     dlc = _get_dlc_dir() if _get_dlc_dir else None
     if not dlc:
         return None
+    # First try as a direct path under the DLC dir (root file or
+    # relative subdir hit). This is the cheap path — no walk required.
     candidate = (dlc / filename).resolve()
     try:
         candidate.relative_to(dlc.resolve())
     except (OSError, ValueError):
         return None
-    if not candidate.exists():
-        return None
-    return candidate
+    if candidate.exists():
+        return candidate
+    # Fallback: recursive search for a basename match. Lets users keep
+    # their library organised in subfolders while the plugin keeps
+    # surfacing songs by basename only (which is what web_library.db
+    # and the meta lookups expect).
+    if "/" not in filename and "\\" not in filename:
+        try:
+            for p in dlc.rglob(filename):
+                if p.is_file() and p.suffix.lower() in (".psarc", ".sloppak"):
+                    return p
+        except OSError:
+            return None
+    return None
 
 
 # ── v3 auto-download: tone3000 model → nam_models/ or nam_irs/ ───────
@@ -1145,6 +1169,11 @@ def _batch_log(msg: str) -> None:
 def _list_library_songs() -> tuple[list[Path], int]:
     """Return (parseable songs, count of cloud-only placeholders).
 
+    Walks the DLC dir RECURSIVELY so libraries organised in subfolders
+    (e.g. one folder per artist) get fully covered. Songs are surfaced
+    with their basename downstream, which matches Slopsmith's own
+    convention in web_library.db.
+
     Cloud-loader users have a DLC dir full of 0-byte PSARC stubs —
     metadata exists in Slopsmith's library DB, but the actual archive
     isn't on disk until the user plays the song (or runs cloud_loader's
@@ -1159,9 +1188,20 @@ def _list_library_songs() -> tuple[list[Path], int]:
         return [], 0
     songs: list[Path] = []
     cloud_only = 0
-    for p in sorted(dlc.iterdir()):
-        if p.suffix.lower() not in (".psarc", ".sloppak"):
-            continue
+    # rglob('*') is recursive. Filter to playable formats and skip the
+    # 0-byte cloud-loader stubs that would otherwise blow up the parser.
+    candidates = []
+    try:
+        for p in dlc.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in (".psarc", ".sloppak"):
+                continue
+            candidates.append(p)
+    except OSError:
+        return [], 0
+    candidates.sort()  # stable ordering for the batch + progress count
+    for p in candidates:
         try:
             if p.stat().st_size == 0:
                 cloud_only += 1
@@ -1562,22 +1602,28 @@ _watcher_state: dict = {
 
 def _watch_scan_dlc() -> dict[str, int] | None:
     """Return {filename: size} for every PSARC/sloppak in the DLC dir,
-    or None if the dir isn't available."""
+    or None if the dir isn't available. RECURSIVE — picks up files
+    nested in subfolders (artist-based or any other organisation)."""
     dlc = _get_dlc_dir() if _get_dlc_dir else None
     if not dlc:
         return None
+    current: dict[str, int] = {}
     try:
-        entries = sorted(dlc.iterdir())
+        for p in dlc.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in (".psarc", ".sloppak"):
+                continue
+            try:
+                # Basename keys to stay consistent with web_library.db
+                # and _list_library_songs. Two subfolders with the same
+                # song basename would collide — first one wins, but that
+                # mirrors the host's own behaviour.
+                current[p.name] = p.stat().st_size
+            except OSError:
+                continue
     except OSError:
         return None
-    current: dict[str, int] = {}
-    for p in entries:
-        if p.suffix.lower() not in (".psarc", ".sloppak"):
-            continue
-        try:
-            current[p.name] = p.stat().st_size
-        except OSError:
-            continue
     return current
 
 
@@ -2839,9 +2885,28 @@ def setup(app, context):
             return False
 
         matches: list[dict] = []
-        for p in sorted(dlc.iterdir()):
-            if p.suffix.lower() not in (".psarc", ".sloppak"):
+        # rglob('*') walks the DLC dir recursively so a library
+        # organised in subfolders (e.g. one per artist) shows every
+        # song, not just the ones the user left at the root.
+        candidates = []
+        try:
+            for p in dlc.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in (".psarc", ".sloppak"):
+                    continue
+                candidates.append(p)
+        except OSError:
+            return {"songs": []}
+        candidates.sort()
+        # Track basename collisions across subfolders. The host's
+        # web_library.db is keyed by basename so collisions would already
+        # be a host-side ambiguity; we just keep the first hit.
+        seen_basenames = set()
+        for p in candidates:
+            if p.name in seen_basenames:
                 continue
+            seen_basenames.add(p.name)
             meta = meta_by_filename.get(p.name, {})
             if not _matches(p.name, meta):
                 continue
