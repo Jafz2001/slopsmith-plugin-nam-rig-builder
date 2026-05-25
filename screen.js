@@ -1243,3 +1243,19 @@ async function tbExtractIRs() {
         status.innerHTML = `<span class="text-red-400">${tbEsc(e.message)}</span>`;
     }
 }
+
+async function tbExportDefaults() {
+    const status = document.getElementById('tb-export-defaults-status');
+    status.textContent = 'Exporting…';
+    try {
+        const r = await fetch(`${TB_API}/export_default_captures`, { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) {
+            status.innerHTML = `<span class="text-red-400">Error: ${tbEsc(data.error || r.status)}</span>`;
+            return;
+        }
+        status.innerHTML = `<span class="text-green-400">Saved ${data.count} gear → capture defaults to default_captures.json.</span>`;
+    } catch (e) {
+        status.innerHTML = `<span class="text-red-400">${tbEsc(e.message)}</span>`;
+    }
+}
