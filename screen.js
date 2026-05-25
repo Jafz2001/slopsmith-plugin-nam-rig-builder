@@ -443,12 +443,28 @@ async function rbListSongs() {
     el.innerHTML = data.songs.map(s => {
         const name = typeof s === 'string' ? s : s.name;
         const mat = typeof s === 'string' ? true : s.materialized;
+        const title = (typeof s === 'object' && s.title) || '';
+        const artist = (typeof s === 'object' && s.artist) || '';
+        const year = (typeof s === 'object' && s.year) || '';
         const cloudTag = mat ? '' : '<span class="text-xs text-blue-400 ml-2">☁ cloud</span>';
         const textColor = mat ? 'text-gray-300' : 'text-gray-500';
+        // Two-line display when metadata is available, otherwise just the
+        // filename (older library that hasn't been re-scanned by Slopsmith).
+        let label;
+        if (title || artist) {
+            const yearTag = year ? ` <span class="text-gray-600">(${rbEsc(year)})</span>` : '';
+            label = `
+                <div class="flex-1 min-w-0">
+                    <div class="truncate">${rbEsc(title || '(untitled)')}${yearTag}</div>
+                    <div class="text-xs text-gray-500 truncate" title="${rbEsc(name)}">${rbEsc(artist || '(unknown artist)')}</div>
+                </div>`;
+        } else {
+            label = `<span class="flex-1 truncate" title="${rbEsc(name)}">${rbEsc(name)}</span>`;
+        }
         return `
             <div onclick="rbLoadSongTones('${rbEsc(name).replace(/'/g,"\\'")}')"
                  class="cursor-pointer hover:bg-dark-700/50 px-3 py-2 rounded text-sm ${textColor} flex items-center">
-                <span class="flex-1 truncate">${rbEsc(name)}</span>
+                ${label}
                 ${cloudTag}
             </div>`;
     }).join('');
@@ -736,13 +752,128 @@ function rbRenderPiece(p, toneIdx, pIdx) {
                 <input type="file" accept="${acceptExt}"
                        onchange="rbUploadFile(this, ${toneIdx}, ${pIdx})"
                        class="text-xs text-gray-500 file:bg-dark-700 file:border-0 file:text-gray-300 file:px-2 file:py-1 file:rounded file:text-xs file:cursor-pointer">
+                <button onclick="rbToggleLibraryPicker(${toneIdx}, ${pIdx})"
+                        title="Pick from your downloaded ${isCab ? 'IRs' : 'NAMs'}"
+                        class="bg-indigo-900/30 hover:bg-indigo-900/50 text-indigo-300 border border-indigo-800/40 px-2 py-1 rounded text-xs">
+                    📚 Library
+                </button>
                 <span class="rb-piece-file text-xs ${stageClass} truncate" title="${rbEsc(hasVst ? effVstPath : (hasFile ? effFile : ''))}">${rbEsc(stageLabel)}</span>
                 ${(hasFile || hasVst) && mode ? `<span class="text-[10px] text-gray-600 whitespace-nowrap">(${rbEsc(mode)})</span>` : ''}
             </div>
+            <div id="rb-lib-${toneIdx}-${pIdx}" class="hidden mt-2 bg-indigo-900/10 border border-indigo-800/30 rounded p-2"></div>
             ${rsKnobsBlock}
             ${rsIrControl}
             ${vstControl}
         </div>`;
+}
+
+// ── Local library picker (pick from already-downloaded NAMs / IRs) ────
+
+// Open/close the per-piece library picker. Loads the file list on first
+// open and caches it; the dropdown then renders client-side filtering.
+async function rbToggleLibraryPicker(toneIdx, pIdx) {
+    const el = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
+    if (!el) return;
+    el.classList.toggle('hidden');
+    if (el.classList.contains('hidden')) return;
+    if (el.dataset.loaded === '1') return;
+    el.innerHTML = `<div class="text-xs text-gray-500">loading library…</div>`;
+    const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
+    const kind = piece.rs_category === 'cab' ? 'ir' : 'nam';
+    try {
+        const r = await fetch(`${RB_API}/local_files?kind=${kind}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        const files = data.files || [];
+        el.dataset.loaded = '1';
+        el.dataset.kind = kind;
+        // Store the full list on the element so the search filter can
+        // re-render without re-fetching.
+        el._rbAllFiles = files;
+        rbRenderLibraryList(el, files, toneIdx, pIdx, kind, '');
+    } catch (e) {
+        el.innerHTML = `<div class="text-xs text-red-400">Failed to load library: ${rbEsc(e.message || e)}</div>`;
+    }
+}
+
+// Initial render of the library picker: lays out the (stable) header
+// with the search input + count badge + the rows container. The input is
+// never re-created after this, so typing doesn't lose focus.
+function rbRenderLibraryList(container, files, toneIdx, pIdx, kind, filter) {
+    const inputId = `rb-lib-search-${toneIdx}-${pIdx}`;
+    const countId = `rb-lib-count-${toneIdx}-${pIdx}`;
+    const rowsId  = `rb-lib-rows-${toneIdx}-${pIdx}`;
+    container.innerHTML = `
+        <div class="flex items-center gap-2 mb-2">
+            <input id="${inputId}" type="text" placeholder="🔍 Filter ${kind === 'ir' ? 'IRs' : 'NAMs'}…"
+                   oninput="rbFilterLibrary(${toneIdx}, ${pIdx})"
+                   value="${rbEsc(filter || '')}"
+                   class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1">
+            <span id="${countId}" class="text-[10px] text-gray-500">${files.length}/${files.length}</span>
+        </div>
+        <div id="${rowsId}" class="max-h-64 overflow-y-auto"></div>`;
+    rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter);
+}
+
+// Inner-only render: refreshes the rows + count badge based on the current
+// filter, but leaves the search <input> alone so focus + cursor position
+// survive every keystroke. Called both on initial paint and on every
+// oninput event.
+function rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter) {
+    const rowsEl  = document.getElementById(`rb-lib-rows-${toneIdx}-${pIdx}`);
+    const countEl = document.getElementById(`rb-lib-count-${toneIdx}-${pIdx}`);
+    if (!rowsEl) return;
+    const f = (filter || '').toLowerCase().trim();
+    const filtered = f
+        ? files.filter(x => x.name.toLowerCase().includes(f))
+        : files;
+    const rows = filtered.slice(0, 50).map(file => {
+        const usedFor = (file.used_for_gears || []).slice(0, 2).join(', ');
+        const usedBadge = file.use_count > 0
+            ? `<span class="text-[10px] text-amber-300/80" title="${rbEsc(usedFor)}">used ${file.use_count}×</span>`
+            : `<span class="text-[10px] text-gray-600">unused</span>`;
+        const safeName = file.name.replace(/'/g, "\\'");
+        return `
+            <div class="flex items-center gap-2 px-2 py-1 hover:bg-indigo-900/20 rounded cursor-pointer"
+                 onclick="rbPickFromLibrary(${toneIdx}, ${pIdx}, '${rbEsc(safeName)}', '${rbEsc(kind)}')">
+                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbEsc(file.name)}</span>
+                ${usedBadge}
+                <button onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(safeName)}', '${rbEsc(kind === 'ir' ? 'ir' : 'nam')}', null)"
+                        title="Audition in isolation"
+                        class="text-[10px] text-gray-400 hover:text-gray-200 px-1">▶</button>
+            </div>`;
+    }).join('');
+    const moreNote = filtered.length > 50
+        ? `<div class="text-[10px] text-gray-500 italic mt-1">…and ${filtered.length - 50} more (refine search)</div>`
+        : '';
+    rowsEl.innerHTML = (rows || '<div class="text-xs text-gray-500 italic">no matches</div>') + moreNote;
+    if (countEl) countEl.textContent = `${filtered.length}/${files.length}`;
+}
+
+function rbFilterLibrary(toneIdx, pIdx) {
+    const container = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
+    if (!container || !container._rbAllFiles) return;
+    const input = document.getElementById(`rb-lib-search-${toneIdx}-${pIdx}`);
+    rbRenderLibraryRows(container, container._rbAllFiles, toneIdx, pIdx,
+                        container.dataset.kind || 'nam', input ? input.value : '');
+}
+
+// Apply a chosen file from the library to this piece. Mirrors the upload
+// flow: set _uploaded_file + _uploaded_kind, re-render, re-audition.
+function rbPickFromLibrary(toneIdx, pIdx, fileName, kind) {
+    const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
+    piece._uploaded_file = fileName;
+    piece._uploaded_kind = kind;
+    // Picking from local library = drop any pending VST assignment so
+    // the NAM/IR takes priority (kind precedence is in rbPersistTone).
+    piece._vst_path = null;
+    piece._vst_format = null;
+    piece._vst_kind = null;
+    piece._vst_state = null;
+    // Collapse the picker so the song-list isn't covered after the click.
+    const lib = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
+    if (lib) lib.classList.add('hidden');
+    rbAfterGearChange(toneIdx);
 }
 
 // ── VST panel rendering + handlers ────────────────────────────────────
@@ -1841,16 +1972,135 @@ function rbRenderCatalogCard(g) {
                     ${t3kLink}${listenBtn}
                     <button onclick="rbOpenSuggest('${rbEsc(g.rs_gear)}')"
                             class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-2.5 py-1 rounded text-xs">Search</button>
+                    <button onclick="rbToggleCatalogLibrary('${rbEsc(g.rs_gear)}','${rbEsc(g.category || '')}')"
+                            title="Pick from your downloaded library and bulk-assign to every preset using this gear"
+                            class="bg-indigo-900/30 hover:bg-indigo-900/50 text-indigo-300 border border-indigo-800/40 px-2.5 py-1 rounded text-xs">📚 Library</button>
                     <button onclick="rbToggleCatalogVstPanel('${rbEsc(vstPanelId)}','${rbEsc(g.rs_gear)}','${rbEsc(g.vst_path || '')}','${rbEsc(g.vst_format || 'VST3')}')"
                             class="bg-purple-900/30 hover:bg-purple-900/50 text-purple-300 border border-purple-800/40 px-2.5 py-1 rounded text-xs">⚙ VST…</button>
                 </div>
             </div>
+            <div id="rb-cat-lib-${rbEsc(g.rs_gear).replace(/[^a-zA-Z0-9_-]/g,'_')}" class="hidden bg-indigo-900/10 border border-indigo-800/30 rounded p-2"></div>
             <div id="${vstPanelId}" class="hidden bg-purple-900/10 border border-purple-800/30 rounded px-2 py-2 space-y-2">
                 <div class="text-[10px] text-purple-200/70">
                     ${knownCount > 0 ? `${knownCount} plugins installed` : 'no plugins scanned yet'} · bulk-assign to every preset using <code>${rbEsc(g.rs_gear)}</code>
                 </div>
             </div>
         </div>`;
+}
+
+// Open the catalog-card library picker (bulk-assigns to every preset using
+// this rs_gear_type). `category` tells us whether to list NAMs or IRs.
+async function rbToggleCatalogLibrary(rsGear, category) {
+    const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const el = document.getElementById(`rb-cat-lib-${safeId}`);
+    if (!el) return;
+    el.classList.toggle('hidden');
+    if (el.classList.contains('hidden')) return;
+    if (el.dataset.loaded === '1') return;
+    el.innerHTML = `<div class="text-xs text-gray-500">loading library…</div>`;
+    const kind = category === 'cab' ? 'ir' : 'nam';
+    try {
+        const r = await fetch(`${RB_API}/local_files?kind=${kind}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        const files = data.files || [];
+        el.dataset.loaded = '1';
+        el.dataset.kind = kind;
+        el._rbAllFiles = files;
+        rbRenderCatalogLibraryList(el, files, rsGear, kind, '');
+    } catch (e) {
+        el.innerHTML = `<div class="text-xs text-red-400">Failed to load library: ${rbEsc(e.message || e)}</div>`;
+    }
+}
+
+function rbRenderCatalogLibraryList(container, files, rsGear, kind, filter) {
+    const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const inputId = `rb-cat-lib-search-${safeId}`;
+    const countId = `rb-cat-lib-count-${safeId}`;
+    const rowsId  = `rb-cat-lib-rows-${safeId}`;
+    container.innerHTML = `
+        <div class="text-[10px] text-indigo-300 mb-1">
+            Pick from your downloaded ${kind === 'ir' ? 'IRs' : 'NAMs'} · click "Use for all" to apply to every preset using <code>${rbEsc(rsGear)}</code>
+        </div>
+        <div class="flex items-center gap-2 mb-2">
+            <input id="${inputId}" type="text" placeholder="🔍 Filter…"
+                   oninput="rbFilterCatalogLibrary('${rbEsc(rsGear)}')"
+                   value="${rbEsc(filter || '')}"
+                   class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1">
+            <span id="${countId}" class="text-[10px] text-gray-500">${files.length}/${files.length}</span>
+        </div>
+        <div id="${rowsId}" class="max-h-64 overflow-y-auto"></div>`;
+    rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter);
+}
+
+function rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter) {
+    const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const rowsEl  = document.getElementById(`rb-cat-lib-rows-${safeId}`);
+    const countEl = document.getElementById(`rb-cat-lib-count-${safeId}`);
+    if (!rowsEl) return;
+    const f = (filter || '').toLowerCase().trim();
+    const filtered = f
+        ? files.filter(x => x.name.toLowerCase().includes(f))
+        : files;
+    const rows = filtered.slice(0, 50).map(file => {
+        const usedBadge = file.use_count > 0
+            ? `<span class="text-[10px] text-amber-300/80" title="${rbEsc((file.used_for_gears || []).join(', '))}">used ${file.use_count}×</span>`
+            : `<span class="text-[10px] text-gray-600">unused</span>`;
+        const safeName = file.name.replace(/'/g, "\\'");
+        return `
+            <div class="flex items-center gap-2 px-2 py-1 hover:bg-indigo-900/20 rounded">
+                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbEsc(file.name)}</span>
+                ${usedBadge}
+                <button onclick="rbAuditionFile('${rbEsc(safeName)}', '${rbEsc(kind === 'ir' ? 'ir' : 'nam')}', null)"
+                        title="Audition in isolation"
+                        class="text-[10px] text-gray-400 hover:text-gray-200 px-1">▶</button>
+                <button onclick="rbCatalogBulkAssignLocal('${rbEsc(rsGear)}', '${rbEsc(safeName)}', '${rbEsc(kind)}')"
+                        title="Apply to every preset using ${rbEsc(rsGear)}"
+                        class="bg-indigo-700 hover:bg-indigo-600 text-white text-[10px] px-2 py-0.5 rounded">Use for all</button>
+            </div>`;
+    }).join('');
+    const moreNote = filtered.length > 50
+        ? `<div class="text-[10px] text-gray-500 italic mt-1">…and ${filtered.length - 50} more (refine search)</div>`
+        : '';
+    rowsEl.innerHTML = (rows || '<div class="text-xs text-gray-500 italic">no matches</div>') + moreNote;
+    if (countEl) countEl.textContent = `${filtered.length}/${files.length}`;
+}
+
+function rbFilterCatalogLibrary(rsGear) {
+    const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const container = document.getElementById(`rb-cat-lib-${safeId}`);
+    if (!container || !container._rbAllFiles) return;
+    const input = document.getElementById(`rb-cat-lib-search-${safeId}`);
+    rbRenderCatalogLibraryRows(container, container._rbAllFiles, rsGear,
+                               container.dataset.kind || 'nam', input ? input.value : '');
+}
+
+// Bulk-assign a local file (NAM or IR) to every preset_pieces row for this
+// rs_gear_type. Uses the same /upload_for_gear endpoint flow — except no
+// upload, just point at an existing file.
+async function rbCatalogBulkAssignLocal(rsGear, fileName, kind) {
+    if (!confirm(`Apply "${fileName}" to every preset using ${rsGear}?`)) return;
+    try {
+        const r = await fetch(`${RB_API}/use_local_for_gear`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                rs_gear: rsGear,
+                local_file: fileName,
+                local_kind: kind,
+            }),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.error || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        alert(`Applied "${fileName}" — ${data.pieces_updated || 0} piece(s) updated across ${data.presets_updated || 0} preset(s).`);
+        // Reload the catalog so cards reflect the new assignment.
+        setTimeout(() => rbLoadCatalog(), 400);
+    } catch (e) {
+        alert(`Bulk assign failed: ${e.message || e}`);
+    }
 }
 
 // Open/close + lazy-fill the catalog card's VST panel. Lazy-fill avoids

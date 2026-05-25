@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import Body, UploadFile, File
@@ -2013,6 +2014,47 @@ def setup(app, context):
 
     # ── v3: per-gear manual auto-download (used from the Sugerir modal) ─
 
+    @app.post("/api/plugins/rig_builder/use_local_for_gear")
+    def use_local_for_gear(data: dict = Body(...)):
+        """Bulk-assign a file already present in nam_models/ or nam_irs/
+        to every preset_pieces row for a given rs_gear_type. Mirrors the
+        post-download path of /download_for_gear (calls
+        _assign_file_to_gear), but skips the tone3000 round-trip — the
+        file is already local.
+
+        Body: `{rs_gear, local_file, local_kind}` where
+          - rs_gear:    e.g. "Amp_TW22"
+          - local_file: relative path under the kind's root
+                        (e.g. "Plexi 51.nam" or "rocksmith/cab_4x12_x.wav")
+          - local_kind: "nam" | "ir" | "rs_ir"
+
+        Returns `{ok, pieces_updated, presets_updated, kind, file}`.
+        """
+        rs_gear = (data.get("rs_gear") or "").strip()
+        local_file = (data.get("local_file") or "").strip()
+        local_kind = (data.get("local_kind") or "").strip().lower()
+        if not rs_gear or not local_file or not local_kind:
+            return JSONResponse(
+                {"error": "rs_gear, local_file, local_kind required"}, 400)
+        if local_kind not in ("nam", "ir", "rs_ir"):
+            return JSONResponse(
+                {"error": f"local_kind must be nam|ir|rs_ir, got {local_kind}"}, 400)
+        # Sanity-check the file actually exists on disk so we never bind
+        # phantom paths.
+        if _config_dir is None:
+            return JSONResponse({"error": "config_dir not initialized"}, 500)
+        root = _config_dir / ("nam_models" if local_kind == "nam" else "nam_irs")
+        target = _safe_child(root, local_file)
+        if target is None or not target.exists():
+            return JSONResponse(
+                {"error": f"file not found: {local_file}"}, 404)
+        # Detect whether the IR is one of the Rocksmith-extracted ones so
+        # the kind column matches what /batch + the catalog filter expect.
+        if local_kind == "ir" and local_file.startswith("rocksmith/"):
+            local_kind = "rs_ir"
+        assigned = _assign_file_to_gear(rs_gear, local_kind, local_file, None)
+        return {"ok": True, "kind": local_kind, "file": local_file, **assigned}
+
     @app.post("/api/plugins/rig_builder/download_for_gear")
     def download_for_gear(data: dict = Body(...)):
         """Manually pull a tone3000 capture for a single Rocksmith gear.
@@ -2460,6 +2502,92 @@ def setup(app, context):
             conn.commit()
         return {"ok": True, "pieces_updated": cur.rowcount}
 
+    @app.get("/api/plugins/rig_builder/local_files")
+    def local_files(kind: str = "nam"):
+        """List all locally-available NAM models or IR WAVs that the user
+        could pick for a piece, with usage stats so the UI can sort by
+        most-used first.
+
+        Query:
+          - kind: "nam" → lists nam_models/*.nam
+                  "ir"  → lists nam_irs/**/*.wav (recursive, includes the
+                          extract_irs.py output under nam_irs/rocksmith/)
+
+        Returns:
+          {"files": [
+            {"name": str (relative to dir root),
+             "size_bytes": int,
+             "mtime_iso": str (ISO 8601),
+             "use_count": int (# of preset_pieces referencing it),
+             "used_for_gears": [rs_gear_type, ...] (distinct)},
+            ...]}
+
+        The list is sorted by use_count DESC then name ASC, so the
+        plugins the user has assigned most often surface to the top.
+        """
+        if _config_dir is None:
+            return JSONResponse({"error": "config_dir not initialized"}, 500)
+        kind = (kind or "nam").lower()
+        if kind == "nam":
+            root = _config_dir / "nam_models"
+            ext = ".nam"
+            recursive = False
+        elif kind in ("ir", "wav"):
+            root = _config_dir / "nam_irs"
+            ext = ".wav"
+            recursive = True
+        else:
+            return JSONResponse({"error": f"unknown kind: {kind}"}, 400)
+        if not root.exists():
+            return {"files": []}
+        # Walk filesystem.
+        paths: list = []
+        iterator = root.rglob(f"*{ext}") if recursive else root.glob(f"*{ext}")
+        for p in iterator:
+            if p.is_file():
+                paths.append(p)
+        # Build a single SQL query to fetch usage stats for ALL files at once
+        # (one round-trip beats N).
+        conn = _get_conn()
+        # Match preset_pieces.file against the relative name we present.
+        # For NAM models the file column stores the bare basename; for IRs
+        # under nam_irs/rocksmith/foo.wav it stores "rocksmith/foo.wav"
+        # (see _assign_file_to_gear and friends — same relative convention).
+        rel_names = [str(p.relative_to(root)) for p in paths]
+        usage: dict[str, dict] = {n: {"count": 0, "gears": []} for n in rel_names}
+        if rel_names:
+            placeholders = ",".join("?" for _ in rel_names)
+            rows = conn.execute(
+                f"SELECT file, COUNT(*), GROUP_CONCAT(DISTINCT rs_gear_type) "
+                f"FROM preset_pieces WHERE file IN ({placeholders}) GROUP BY file",
+                tuple(rel_names),
+            ).fetchall()
+            for fname, n, gears in rows:
+                usage[fname] = {
+                    "count": int(n),
+                    "gears": [g for g in (gears or "").split(",") if g],
+                }
+        out = []
+        for p, n in zip(paths, rel_names):
+            try:
+                st = p.stat()
+                size_bytes = st.st_size
+                mtime_iso = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+            except OSError:
+                size_bytes = 0
+                mtime_iso = ""
+            u = usage[n]
+            out.append({
+                "name": n,
+                "size_bytes": size_bytes,
+                "mtime_iso": mtime_iso,
+                "use_count": u["count"],
+                "used_for_gears": u["gears"],
+            })
+        # Sort: most-used first, then alphabetical.
+        out.sort(key=lambda f: (-f["use_count"], f["name"].lower()))
+        return {"files": out, "kind": kind, "total": len(out)}
+
     @app.get("/api/plugins/rig_builder/vst/knob_mapping")
     def vst_knob_mapping(rs_gear_type: str, vst_name: str):
         """Lookup the per-VST translation table for a Rocksmith gear:
@@ -2658,20 +2786,64 @@ def setup(app, context):
     @app.get("/api/plugins/rig_builder/list_songs")
     def list_songs(q: str = "", limit: int = 50):
         """Return playable songs from DLC dir, optionally filtered by
-        substring on the filename. Each entry carries a `materialized`
-        flag so the UI can mark cloud-only stubs (0-byte placeholders
-        for files that still live in Google Drive) and trigger
-        cloud_loader/materialize on click.
+        substring on title / artist / filename. Each entry carries a
+        `materialized` flag (so the UI can mark cloud-only stubs and
+        trigger cloud_loader/materialize on click), plus `title` and
+        `artist` from Slopsmith's web_library.db cache if available.
+        Falls back to filename-only when the cache lacks an entry
+        (e.g. brand-new song the host hasn't indexed yet).
         """
         dlc = _get_dlc_dir() if _get_dlc_dir else None
         if not dlc:
             return {"songs": []}
-        q_lower = q.lower()
+        # Read the host's pre-parsed (title, artist, album, year) cache.
+        # web_library.db is the source of truth populated by Slopsmith's
+        # own library scanner — we just JOIN with it read-only so the
+        # rig_builder UI shows the same labels the user sees elsewhere
+        # in the app. Missing/old file = falls back to filename only.
+        meta_by_filename: dict[str, dict] = {}
+        if _config_dir is not None:
+            wl_path = _config_dir / "web_library.db"
+            if wl_path.exists():
+                try:
+                    c = sqlite3.connect(f"file:{wl_path}?mode=ro", uri=True)
+                    try:
+                        for fname, title, artist, album, year in c.execute(
+                            "SELECT filename, title, artist, album, year FROM songs"
+                        ):
+                            meta_by_filename[fname] = {
+                                "title": title or "",
+                                "artist": artist or "",
+                                "album": album or "",
+                                "year": year or "",
+                            }
+                    finally:
+                        c.close()
+                except sqlite3.Error:
+                    log.warning("could not read web_library.db", exc_info=True)
+
+        q_lower = (q or "").lower().strip()
+
+        def _matches(name: str, meta: dict) -> bool:
+            if not q_lower:
+                return True
+            if q_lower in name.lower():
+                return True
+            # Title / artist / album are user-facing; search them too so
+            # typing "strokes" finds Reptilia even though the filename is
+            # "Strokes-The_Reptilia_v1.psarc".
+            for k in ("title", "artist", "album"):
+                v = (meta.get(k) or "").lower()
+                if v and q_lower in v:
+                    return True
+            return False
+
         matches: list[dict] = []
         for p in sorted(dlc.iterdir()):
             if p.suffix.lower() not in (".psarc", ".sloppak"):
                 continue
-            if q_lower and q_lower not in p.name.lower():
+            meta = meta_by_filename.get(p.name, {})
+            if not _matches(p.name, meta):
                 continue
             try:
                 size = p.stat().st_size
@@ -2681,7 +2853,23 @@ def setup(app, context):
                 "name": p.name,
                 "size": size,
                 "materialized": size > 0,
+                "title": meta.get("title", ""),
+                "artist": meta.get("artist", ""),
+                "album": meta.get("album", ""),
+                "year": meta.get("year", ""),
             })
             if len(matches) >= limit:
                 break
+
+        # Sort: songs with metadata first (sorted by artist then title),
+        # then the unmatched filename-only ones (alphabetical) as fallback.
+        def _key(entry):
+            has_meta = bool(entry["title"] or entry["artist"])
+            return (
+                0 if has_meta else 1,
+                (entry["artist"] or "").lower(),
+                (entry["title"] or "").lower(),
+                entry["name"].lower(),
+            )
+        matches.sort(key=_key)
         return {"songs": matches}
