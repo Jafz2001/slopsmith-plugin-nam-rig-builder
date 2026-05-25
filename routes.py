@@ -898,16 +898,16 @@ def _recompute_preset_primaries(conn: sqlite3.Connection, preset_id: int) -> Non
 def _assign_file_to_gear(
     rs_gear: str, kind: str, file: str, tone3000_id: int | None = None,
 ) -> dict:
-    """Stamp a downloaded file onto every *pending* preset_pieces row for
-    `rs_gear` and refresh the affected presets' primary model/IR.
+    """Stamp a downloaded file onto every preset_pieces row for `rs_gear`
+    (replacing any prior assignment) and refresh the affected presets'
+    primary model/IR.
 
-    This is what moves a gear out of the Pendientes list after a manual
-    "Download and assign": the coverage query counts a gear as pending
-    while any of its pieces has `kind='none'` or an empty `file`, and
-    the nam_tone runtime only plays `presets.model_file` / `ir_file`.
-    Updating just the pieces (as the old code implicitly relied on the
-    song-view "Save preset" step to do) left both stale, so the gear
-    stayed pending and the song kept playing the generic synth.
+    This is the manual "Download and assign" path. It moves a gear out of
+    the Pending list AND replaces an existing capture when the user picks a
+    new one (the coverage query counts a gear as pending while any piece has
+    `kind='none'` / empty `file`, and the nam_tone runtime only plays
+    `presets.model_file` / `ir_file`). It updates ALL of the gear's rows so
+    a re-pick actually takes effect rather than keeping the old NAM.
 
     Returns `{pieces_updated, presets_updated}`. If the gear has no
     preset rows yet (never batched/saved), both are 0 and the caller's
@@ -915,17 +915,22 @@ def _assign_file_to_gear(
     """
     conn = _get_conn()
     with _lock:
+        # Update EVERY preset_pieces row for this gear, not just pending
+        # ones. This is the explicit user "Download and assign" path (the
+        # only caller), so re-picking a capture for a gear that already has
+        # one must REPLACE the old file — otherwise the gear keeps the
+        # previous NAM (the bug). Auto/batch flows don't call this; they go
+        # through _persist_preset_chain / _download_candidate.
         affected = [
             r[0] for r in conn.execute(
-                "SELECT DISTINCT preset_id FROM preset_pieces "
-                "WHERE rs_gear_type = ? AND (kind = 'none' OR file IS NULL OR file = '')",
+                "SELECT DISTINCT preset_id FROM preset_pieces WHERE rs_gear_type = ?",
                 (rs_gear,),
             ).fetchall()
         ]
         cur = conn.execute(
             "UPDATE preset_pieces "
             "SET kind = ?, file = ?, tone3000_id = ?, assigned_mode = 'manual' "
-            "WHERE rs_gear_type = ? AND (kind = 'none' OR file IS NULL OR file = '')",
+            "WHERE rs_gear_type = ?",
             (kind, file, tone3000_id, rs_gear),
         )
         pieces_updated = cur.rowcount

@@ -1162,6 +1162,7 @@ async function tbDownloadForGear(btn, rsGear, toneId) {
         // is open to reflect that the gear is no longer pending.
         if (tbState.currentTab === 'pending') tbLoadPending();
         else if (tbState.currentTab === 'dashboard') tbLoadCoverage();
+        else if (tbState.currentTab === 'gear') tbLoadCatalog();
         // Reflect the new assignment in the open song view now (and
         // re-audition if a tone using this gear is currently previewing) —
         // no need to re-select the song.

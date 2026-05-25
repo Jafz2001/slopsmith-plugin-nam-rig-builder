@@ -680,6 +680,18 @@ tone3000 link, and ▶ to audition.
   `DI_Amp_TubePre`) fall under "Otros" — expected; many CDLC use the
   generic `Cabinets` entity rather than a specific cab.
 
+## Fix: re-assigning a gear now replaces the old NAM (2026-05-24)
+
+`_assign_file_to_gear` (the manual "Download and assign" path, sole caller)
+previously updated only *pending* preset_pieces rows (`kind='none'`/empty
+file). So picking a new capture for a gear that was **already assigned**
+changed nothing — it kept the previous NAM (visible in the Gear tab). It now
+updates **every** row for that gear (replacing the file across all presets
+that use it) and recomputes their primaries. Auto/batch flows are unaffected
+(they use `_persist_preset_chain` / `_download_candidate`, not this). The Gear
+tab also reloads after a download (`tbDownloadForGear` → `tbLoadCatalog` when
+`currentTab === 'gear'`).
+
 ## What is **not** done (v3+)
 
 1. **Multi-stage chain playback — RESOLVED in v3.8** (full-chain fetch
