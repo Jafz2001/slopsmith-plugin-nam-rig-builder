@@ -703,6 +703,24 @@ auto-save. (Round-trip verified: persisted `bypassed` reads back via
 `/song`'s preset-scoped `bypass_map`.) The "Save preset" button still exists
 (explicit save + confirmation).
 
+## Default capture map (ship curated gear→tone choices) (2026-05-25)
+
+`default_captures.json` (shipped in the plugin) maps
+`rs_gear → {tone3000_id, kind, model_id}` — a curated default of which
+tone3000 capture to use per gear. The **batch** and **per-song
+auto-download** flows now prefer this map over a fresh tone3000 search
+(`_load_default_captures()`), so a new install reproduces the maintainer's
+exact tone choices (with an API key to download the files; the files
+themselves are NOT shipped — only the ids). Regenerate from the current DB
+via Settings → "Export defaults" (`POST /export_default_captures` →
+`_build_default_captures()`), or it's a one-off snapshot. Gears not in the
+map fall back to search/pick as before.
+
+NOTE: the batch (`_batch_worker`) still **replaces** each tone's chain
+(DELETE+INSERT in `_persist_preset_chain`) and does NOT preserve per-tone
+bypass or RS-IR variant picks — running it over a hand-tuned library resets
+those. Making the batch skip already-mapped tones is a proposed follow-up.
+
 ## What is **not** done (v3+)
 
 1. **Multi-stage chain playback — RESOLVED in v3.8** (full-chain fetch

@@ -156,5 +156,17 @@
             </div>
             <div id="tb-extract-irs-status" class="text-xs text-gray-500"></div>
         </div>
+
+        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mt-6">
+            <h3 class="text-white font-semibold mb-3">Export my mappings as defaults</h3>
+            <p class="text-gray-500 text-sm mb-3">
+                Snapshot your current gear → tone3000 capture choices into
+                <code class="bg-dark-800 px-1 rounded">default_captures.json</code> (shipped
+                with the plugin). A fresh install then auto-downloads these exact
+                captures during batch / auto-download instead of searching tone3000.
+            </p>
+            <button onclick="tbExportDefaults()" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Export defaults</button>
+            <div id="tb-export-defaults-status" class="text-xs text-gray-500 mt-2"></div>
+        </div>
     </div>
 </div>

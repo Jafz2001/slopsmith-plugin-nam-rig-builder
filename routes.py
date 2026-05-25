@@ -20,6 +20,7 @@ only consumes the primary amp/cab pair encoded in `presets`.
 import base64
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -48,6 +49,7 @@ _lock = threading.Lock()
 
 _rs_to_real: dict | None = None
 _rs_cab_to_ir: dict | None = None
+_default_captures: dict | None = None  # gear -> {tone3000_id, kind, model_id}
 _settings: dict | None = None  # tone3000_api_key, min_downloads, aggressive
 
 # tone3000 client is recreated when the user updates settings, so we
@@ -232,6 +234,51 @@ def _load_rs_to_real() -> dict:
 def _invalidate_rs_to_real() -> None:
     global _rs_to_real
     _rs_to_real = None
+
+
+def _load_default_captures() -> dict:
+    """Load (and cache) default_captures.json: a curated `rs_gear ->
+    {tone3000_id, kind, model_id}` map shipped with the plugin. The
+    batch / auto-download flows prefer these exact captures over a fresh
+    tone3000 search, so a new install reproduces the maintainer's tone
+    choices. Empty dict if the file is absent (then search/pick is used)."""
+    global _default_captures
+    if _default_captures is None:
+        path = _plugin_dir / "default_captures.json"
+        try:
+            _default_captures = json.loads(path.read_text()) if path.exists() else {}
+        except json.JSONDecodeError:
+            log.error("default_captures.json is corrupt", exc_info=True)
+            _default_captures = {}
+    return _default_captures
+
+
+def _invalidate_default_captures() -> None:
+    global _default_captures
+    _default_captures = None
+
+
+def _build_default_captures() -> dict:
+    """Snapshot the current DB's gear -> capture assignments into the
+    shippable map. Picks, per gear, the most recent row that has a
+    tone3000_id + file. Returns the dict (caller writes it to disk)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT rs_gear_type, kind, file, tone3000_id, id FROM preset_pieces "
+        "WHERE tone3000_id IS NOT NULL AND file IS NOT NULL AND file != '' "
+        "ORDER BY id DESC"
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for gear, kind, file, t3kid, _id in rows:
+        if gear in out:
+            continue  # rows are DESC by id → first seen is the latest
+        # model id is embedded in the filename: tone3000_{tone}_m{model}_...
+        model_id = None
+        m = re.search(r"_m(\d+)_", file or "")
+        if m:
+            model_id = int(m.group(1))
+        out[gear] = {"tone3000_id": int(t3kid), "kind": kind, "model_id": model_id}
+    return out
 
 
 def _load_rs_cab_to_ir() -> dict:
@@ -1112,12 +1159,19 @@ def _batch_worker():
                         if client.has_api_access and query:
                             try:
                                 from tone3000_client import pick_top_candidate
-                                resp = client.search_tones(query, gears=gears or None, platform=platform, page_size=5)
-                                top = pick_top_candidate(
-                                    resp,
-                                    aggressive=settings.get("aggressive", False),
-                                    min_downloads=settings.get("min_downloads", 50),
-                                )
+                                # Prefer a bundled default capture for this gear
+                                # (default_captures.json) over a fresh search,
+                                # so a new install reproduces the curated tones.
+                                _dflt = _load_default_captures().get(rs_type)
+                                if _dflt and _dflt.get("tone3000_id"):
+                                    top = {"id": _dflt["tone3000_id"], "title": "default"}
+                                else:
+                                    resp = client.search_tones(query, gears=gears or None, platform=platform, page_size=5)
+                                    top = pick_top_candidate(
+                                        resp,
+                                        aggressive=settings.get("aggressive", False),
+                                        min_downloads=settings.get("min_downloads", 50),
+                                    )
                                 if top:
                                     candidate = {"tone3000_id": top.get("id"), "title": top.get("title")}
                                     # v3: auto-download the picked model into
@@ -1280,14 +1334,19 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                     cached = {}
                     try:
                         from tone3000_client import pick_top_candidate
-                        resp = client.search_tones(
-                            query, gears=gears or None, platform=platform, page_size=5,
-                        )
-                        top = pick_top_candidate(
-                            resp,
-                            aggressive=settings.get("aggressive", False),
-                            min_downloads=settings.get("min_downloads", 50),
-                        )
+                        # Prefer a bundled default capture (default_captures.json).
+                        _dflt = _load_default_captures().get(rs_type)
+                        if _dflt and _dflt.get("tone3000_id"):
+                            top = {"id": _dflt["tone3000_id"], "title": "default"}
+                        else:
+                            resp = client.search_tones(
+                                query, gears=gears or None, platform=platform, page_size=5,
+                            )
+                            top = pick_top_candidate(
+                                resp,
+                                aggressive=settings.get("aggressive", False),
+                                min_downloads=settings.get("min_downloads", 50),
+                            )
                         if top:
                             cached["tone3000_id"] = top.get("id")
                             downloaded = _download_candidate(
@@ -1927,6 +1986,23 @@ def setup(app, context):
             log.exception("save_preset failed")
             return JSONResponse({"error": f"{type(e).__name__}: {e}"}, 500)
         return {"ok": True, "preset_id": preset_id}
+
+    # ── Export current gear→capture assignments as shipped defaults ───
+    @app.post("/api/plugins/nam_rig_builder/export_default_captures")
+    def export_default_captures():
+        """Snapshot the current DB's gear→capture choices into
+        default_captures.json (shipped with the plugin). A fresh install
+        then auto-downloads these exact captures during batch/auto-download
+        instead of searching tone3000 fresh. Returns the entry count."""
+        try:
+            captures = _build_default_captures()
+            path = _plugin_dir / "default_captures.json"
+            path.write_text(json.dumps(captures, indent=2, sort_keys=True))
+            _invalidate_default_captures()
+        except Exception as e:
+            log.exception("export_default_captures failed")
+            return JSONResponse({"error": f"{type(e).__name__}: {e}"}, 500)
+        return {"ok": True, "count": len(captures)}
 
     # ── Full-chain native preset (experimental multi-NAM preview) ─────
     @app.get("/api/plugins/nam_rig_builder/native_preset_full/{preset_id}")
