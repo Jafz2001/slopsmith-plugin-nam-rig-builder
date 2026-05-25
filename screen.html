@@ -37,15 +37,22 @@
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5">
             <h3 class="text-white font-semibold mb-2">Map the entire library</h3>
             <p class="text-gray-500 text-sm mb-4">
-                Parses every PSARC/sloppak and records the Rocksmith gear
-                as pending entries. If a tone3000 API key is configured,
-                it also suggests a capture per unique gear under the
-                conservative policy (CC0/CC-BY, minimum downloads).
+                Parses every PSARC/sloppak and maps each gear to a tone3000
+                capture (preferring your default-capture map). Choose how it
+                treats songs you've already set up:
             </p>
-            <button id="tb-batch-btn" onclick="tbStartBatch()"
-                    class="bg-accent hover:bg-accent/80 text-white px-5 py-2 rounded-xl text-sm transition">
-                Start batch
-            </button>
+            <div class="flex flex-wrap gap-3">
+                <button class="tb-batch-btn bg-dark-600 hover:bg-dark-500 text-gray-200 px-5 py-2 rounded-xl text-sm transition"
+                        onclick="tbStartBatch('new')"
+                        title="Only map songs that have no preset yet — never touches what you've already configured">
+                    Map new songs only
+                </button>
+                <button class="tb-batch-btn bg-accent hover:bg-accent/80 text-white px-5 py-2 rounded-xl text-sm transition"
+                        onclick="tbStartBatch('all')"
+                        title="(Re)map every song with the current/default presets. Re-resolves captures but keeps each tone's bypass and chosen cab-IR variant">
+                    Remap all
+                </button>
+            </div>
             <div id="tb-batch-progress" class="hidden mt-4">
                 <div class="flex items-center gap-3 mb-2 text-sm text-gray-400">
                     <span id="tb-batch-pct">0%</span>

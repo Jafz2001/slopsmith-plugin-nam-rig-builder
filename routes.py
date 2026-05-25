@@ -1059,12 +1059,17 @@ def _list_library_songs() -> tuple[list[Path], int]:
     return songs, cloud_only
 
 
-def _batch_worker():
+def _batch_worker(mode: str = "all"):
     """Library-wide auto-assign: unique gear → tone3000 candidate (if
-    API access) → recorded as 'pending' otherwise. No downloads run in
-    the v0 worker — that's the user's manual step. We still create
-    `preset_pieces` rows with kind='none' so the Pendientes tab knows
-    what's outstanding.
+    API access) → recorded as 'pending' otherwise.
+
+    `mode`:
+    - "all" — (re)map every tone. Re-resolves captures (preferring the
+      default-capture map) but **preserves** each tone's saved bypass and
+      chosen cab-IR variant, so a re-run refreshes tones without wiping
+      manual tweaks.
+    - "new" — only map tones that have NO preset yet; already-mapped tones
+      are left completely untouched.
     """
     global _batch_disk_bytes
     try:
@@ -1121,6 +1126,27 @@ def _batch_worker():
                 preset_name = f"{filename}::{tone_key}" if tone_key else f"{filename}::{parsed['name']}"
                 pieces: list[dict] = []
 
+                # Preserve the user's per-tone tweaks across a re-run: load
+                # this tone's existing preset pieces (by gear) so we can keep
+                # the saved bypass state and the chosen cab-IR variant rather
+                # than resetting them. (Files are still re-resolved.)
+                existing_by_gear: dict[str, dict] = {}
+                _ekey = tone_key or parsed["name"]
+                _erow = _get_conn().execute(
+                    "SELECT preset_id FROM tone_mappings WHERE filename = ? AND tone_key = ?",
+                    (filename, _ekey),
+                ).fetchone()
+                if _erow:
+                    if mode == "new":
+                        # "Map new songs only": leave already-mapped tones
+                        # completely untouched.
+                        continue
+                    for _pr in _get_conn().execute(
+                        "SELECT rs_gear_type, bypassed, kind, file FROM preset_pieces WHERE preset_id = ?",
+                        (_erow[0],),
+                    ).fetchall():
+                        existing_by_gear[_pr[0]] = {"bypassed": bool(_pr[1]), "kind": _pr[2], "file": _pr[3]}
+
                 for piece in parsed["chain"]:
                     rs_type = piece["type"]
                     info = rs_map.get(rs_type) or {}
@@ -1142,14 +1168,21 @@ def _batch_worker():
                     irs_root = _config_dir / "nam_irs"
                     available = [f for f in rs_ir_files if (irs_root / f).exists()]
                     if category == "cab" and available:
+                        _prev = existing_by_gear.get(rs_type, {})
+                        # Keep the user's chosen mic-position variant if it's
+                        # still on disk; otherwise default to the first.
+                        _cab_file = (_prev.get("file")
+                                     if _prev.get("kind") == "rs_ir" and _prev.get("file") in available
+                                     else available[0])
                         pieces.append({
                             "slot": piece["slot"],
                             "rs_gear_type": rs_type,
                             "kind": "rs_ir",
-                            "file": available[0],  # default to first variant
+                            "file": _cab_file,
                             "params": piece["knobs"],
                             "tone3000_id": None,
                             "assigned_mode": "auto",
+                            "bypassed": _prev.get("bypassed", False),
                         })
                         continue
 
@@ -1206,6 +1239,7 @@ def _batch_worker():
                         "params": piece["knobs"],
                         "tone3000_id": candidate.get("tone3000_id"),
                         "assigned_mode": "auto",
+                        "bypassed": existing_by_gear.get(rs_type, {}).get("bypassed", False),
                     })
 
                 _persist_preset_chain(
@@ -2205,8 +2239,11 @@ def setup(app, context):
     # ── Batch ─────────────────────────────────────────────────────────
 
     @app.post("/api/plugins/nam_rig_builder/batch_all")
-    def batch_all():
+    def batch_all(data: dict = Body(default={})):
         global _batch_thread
+        mode = (data or {}).get("mode", "all")
+        if mode not in ("all", "new"):
+            mode = "all"
         with _batch_lock:
             if _batch_state["running"]:
                 return JSONResponse({"error": "batch already running"}, 409)
@@ -2221,9 +2258,11 @@ def setup(app, context):
                 "started_at": None,
                 "finished_at": None,
             })
-        _batch_thread = threading.Thread(target=_batch_worker, name="nam_rig_builder_batch", daemon=True)
+        _batch_thread = threading.Thread(
+            target=_batch_worker, args=(mode,), name="nam_rig_builder_batch", daemon=True
+        )
         _batch_thread.start()
-        return {"ok": True}
+        return {"ok": True, "mode": mode}
 
     @app.get("/api/plugins/nam_rig_builder/batch_status")
     def batch_status():

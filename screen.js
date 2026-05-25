@@ -192,18 +192,23 @@ async function tbLoadCoverage() {
 
 // ── Dashboard: batch ───────────────────────────────────────────────
 
-async function tbStartBatch() {
-    const btn = document.getElementById('tb-batch-btn');
-    btn.disabled = true;
+async function tbStartBatch(mode) {
+    mode = mode || 'all';
+    const btns = document.querySelectorAll('.tb-batch-btn');
+    btns.forEach(b => { b.disabled = true; });
     try {
-        const r = await fetch(`${TB_API}/batch_all`, { method: 'POST' });
+        const r = await fetch(`${TB_API}/batch_all`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode }),
+        });
         if (!r.ok) {
             const err = await r.json().catch(() => ({}));
             alert(`Couldn't start batch: ${err.error || r.status}`);
             return;
         }
     } finally {
-        btn.disabled = false;
+        btns.forEach(b => { b.disabled = false; });
     }
     document.getElementById('tb-batch-progress').classList.remove('hidden');
     if (tbState.batchPoll) clearInterval(tbState.batchPoll);
