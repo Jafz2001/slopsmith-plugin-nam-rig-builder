@@ -824,6 +824,18 @@ function rbRenderLibraryList(container, files, toneIdx, pIdx, kind, filter) {
 // filter, but leaves the search <input> alone so focus + cursor position
 // survive every keystroke. Called both on initial paint and on every
 // oninput event.
+// Disambiguate library rows that share a tone3000 title (several captures
+// can all be called "EQ"): show the title, and append the technical filename
+// in muted text only when the title alone is ambiguous in the shown list.
+function rbLibLabel(file, titleCounts) {
+    const t = file.title;
+    if (!t) return rbEsc(file.name);
+    if ((titleCounts[t] || 0) > 1) {
+        return `${rbEsc(t)} <span class="text-gray-500">· ${rbEsc(file.name)}</span>`;
+    }
+    return rbEsc(t);
+}
+
 function rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter) {
     const rowsEl  = document.getElementById(`rb-lib-rows-${toneIdx}-${pIdx}`);
     const countEl = document.getElementById(`rb-lib-count-${toneIdx}-${pIdx}`);
@@ -832,6 +844,8 @@ function rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter) {
     const filtered = f
         ? files.filter(x => (x.name + ' ' + (x.title || '')).toLowerCase().includes(f))
         : files;
+    const titleCounts = {};
+    filtered.forEach(x => { if (x.title) titleCounts[x.title] = (titleCounts[x.title] || 0) + 1; });
     const rows = filtered.slice(0, 50).map(file => {
         const usedFor = (file.used_for_gears || []).slice(0, 2).join(', ');
         const usedBadge = file.use_count > 0
@@ -841,7 +855,7 @@ function rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter) {
         return `
             <div class="flex items-center gap-2 px-2 py-1 hover:bg-indigo-900/20 rounded cursor-pointer"
                  onclick="rbPickFromLibrary(${toneIdx}, ${pIdx}, '${rbEsc(safeName)}', '${rbEsc(kind)}')">
-                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbEsc(file.title || file.name)}</span>
+                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbLibLabel(file, titleCounts)}</span>
                 ${usedBadge}
                 <button onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(safeName)}', '${rbEsc(kind === 'ir' ? 'ir' : 'nam')}', null)"
                         title="Audition in isolation"
@@ -2047,6 +2061,8 @@ function rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter) {
     const filtered = f
         ? files.filter(x => (x.name + ' ' + (x.title || '')).toLowerCase().includes(f))
         : files;
+    const titleCounts = {};
+    filtered.forEach(x => { if (x.title) titleCounts[x.title] = (titleCounts[x.title] || 0) + 1; });
     const rows = filtered.slice(0, 50).map(file => {
         const usedBadge = file.use_count > 0
             ? `<span class="text-[10px] text-amber-300/80" title="${rbEsc((file.used_for_gears || []).join(', '))}">used ${file.use_count}×</span>`
@@ -2054,7 +2070,7 @@ function rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter) {
         const safeName = file.name.replace(/'/g, "\\'");
         return `
             <div class="flex items-center gap-2 px-2 py-1 hover:bg-indigo-900/20 rounded">
-                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbEsc(file.title || file.name)}</span>
+                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbLibLabel(file, titleCounts)}</span>
                 ${usedBadge}
                 <button onclick="rbAuditionFile('${rbEsc(safeName)}', '${rbEsc(kind === 'ir' ? 'ir' : 'nam')}', null)"
                         title="Audition in isolation"
