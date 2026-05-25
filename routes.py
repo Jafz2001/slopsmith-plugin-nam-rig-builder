@@ -20,6 +20,7 @@ only consumes the primary amp/cab pair encoded in `presets`.
 import base64
 import json
 import logging
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -423,6 +424,26 @@ def _guess_category_from_slot(slot: str) -> str:
     return "pedal"
 
 
+def _gear_category(rs_gear: str) -> str:
+    """Category for a gear: from rs_to_real if known, else guessed from the
+    entity name. Catch-all entities ('Cabinets', 'Pedals', 'DI_Amp_*') are
+    NOT in rs_to_real, so without this they default to 'amp' — which made
+    the cab's Suggest search look for amp NAMs (platform=nam) and download
+    cabs as NAMs instead of cab IRs. Used by /search and download_for_gear,
+    which only have the rs_gear (not the slot)."""
+    info = _load_rs_to_real().get(rs_gear) or {}
+    if info.get("category"):
+        return info["category"]
+    name = rs_gear.lower()
+    if "cab" in name:
+        return "cab"
+    if "pedal" in name:
+        return "pedal"
+    if "rack" in name:
+        return "rack"
+    return "amp"
+
+
 # ── PSARC / sloppak readers ──────────────────────────────────────────
 
 
@@ -635,17 +656,27 @@ def _download_candidate(
                 pass
             return None
         ok = _ffmpeg_normalize_ir(tmp_path, final_path)
+        if not ok:
+            # ffmpeg unavailable/failed — fall back to a raw copy (matches
+            # nam_tone's IR-upload behaviour). tone3000 cab IRs are usually
+            # already 48k mono float32 WAV, so this plays fine, and it's far
+            # better than dropping the assignment (which left the cab
+            # unchanged on re-download).
+            log.warning("ffmpeg normalization failed for %s — using raw copy", rs_gear)
+            try:
+                shutil.copyfile(tmp_path, final_path)
+            except Exception:
+                log.warning("raw IR copy also failed for %s — IR not assigned", rs_gear)
+                for p in (tmp_path, final_path):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                return None
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
-        if not ok:
-            log.warning("ffmpeg normalization failed for %s — IR not assigned", rs_gear)
-            try:
-                final_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None
         _batch_disk_bytes += final_path.stat().st_size
         return ("ir", final_name)
 
@@ -1693,7 +1724,7 @@ def setup(app, context):
         """
         rs_map = _load_rs_to_real()
         info = rs_map.get(rs_gear) or {}
-        category = info.get("category", "amp")
+        category = _gear_category(rs_gear)
         query = query_override.strip() or info.get("tone3000_query") or rs_gear
         gears = gears_override.strip() or info.get("tone3000_gears") or ""
         platform = _PLATFORM_FOR_CATEGORY.get(category, "nam")
@@ -1798,7 +1829,7 @@ def setup(app, context):
             return JSONResponse({"error": "rs_gear and tone3000_id required"}, 400)
         settings = _load_settings()
         info = _load_rs_to_real().get(rs_gear) or {}
-        category = info.get("category", "amp")
+        category = _gear_category(rs_gear)
         # Manual downloads bypass the batch disk budget — the user
         # explicitly asked for this one file.
         global _batch_disk_bytes
