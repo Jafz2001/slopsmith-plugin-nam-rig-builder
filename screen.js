@@ -1039,18 +1039,34 @@ async function rbDoVstScan(statusSetter) {
         throw new Error('scan already in progress');
     }
     rbState._vstScanInProgress = true;
+    // The native scan instantiates every installed VST3/AU to validate it,
+    // which on a machine with many plugins is slow and can HANG outright on
+    // a malformed plugin — the engine has no internal timeout. Race it
+    // against a wall-clock limit so the UI never gets stuck on "scanning…"
+    // forever. We can't truly cancel the native scan, so it may keep running
+    // in the background after a timeout; we just stop waiting and report it.
+    const SCAN_TIMEOUT_MS = 120000;
+    let scanTimer;
+    const scanTimeout = new Promise((_, reject) => {
+        scanTimer = setTimeout(
+            () => reject(new Error(
+                `timed out after ${SCAN_TIMEOUT_MS / 1000}s — a slow or incompatible `
+                + `plugin is likely hanging the engine. Check the console for the last `
+                + `scanned path, remove that plugin, then relaunch Slopsmith and retry.`)),
+            SCAN_TIMEOUT_MS);
+    });
     try {
         statusSetter && statusSetter('scanning… (up to a minute · don\'t click anything)');
         // scanPlugins returns the list directly per the audio_engine plugin
         // (see bundle/audio_engine/screen.js:744). Older signatures returned
         // void — handle both.
         let plugins;
-        const ret = await api.scanPlugins();
+        const ret = await Promise.race([api.scanPlugins(), scanTimeout]);
         if (Array.isArray(ret)) {
             plugins = ret;
         } else {
             // Older return-void signature → fetch list separately.
-            plugins = await api.getKnownPlugins();
+            plugins = await Promise.race([api.getKnownPlugins(), scanTimeout]);
         }
         rbState.knownVsts = Array.isArray(plugins) ? plugins : [];
         // Persist to BOTH caches: engine-side (so a future loadPluginList
@@ -1068,6 +1084,7 @@ async function rbDoVstScan(statusSetter) {
         statusSetter && statusSetter(`found ${rbState.knownVsts.length} plugins`);
         return rbState.knownVsts;
     } finally {
+        clearTimeout(scanTimer);
         rbState._vstScanInProgress = false;
     }
 }
