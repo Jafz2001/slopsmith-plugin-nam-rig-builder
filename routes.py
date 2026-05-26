@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -33,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import Body, UploadFile, File
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 log = logging.getLogger("slopsmith.plugin.rig_builder")
 
@@ -59,6 +60,15 @@ _settings: dict | None = None  # tone3000_api_key, min_downloads, aggressive
 # concurrent batch + settings change.
 _t3k_client = None
 _t3k_lock = threading.Lock()
+
+# Pending OAuth authorizations, keyed by the `state` we send to tone3000.
+# Each entry holds the PKCE verifier + the exact redirect_uri used (the
+# token exchange must echo it back). Pruned by age on each /oauth/start.
+# In-memory is fine: the backend is a single uvicorn worker, and an
+# interrupted flow just means the user clicks "Connect" again.
+_oauth_pending: dict[str, dict] = {}
+_oauth_lock = threading.Lock()
+_OAUTH_PENDING_TTL = 600  # seconds a started auth stays valid
 
 # Background batch job state. The web layer polls _batch_state via
 # /batch_status; only the worker thread mutates it (under _batch_lock).
@@ -89,7 +99,13 @@ _SETTINGS_FILENAME = "rig_builder_settings.json"
 _LEGACY_SETTINGS_FILENAME = "nam_rig_builder_settings.json"
 
 _DEFAULT_SETTINGS = {
-    "tone3000_api_key": "",
+    "tone3000_api_key": "",             # secret key (advanced/legacy Bearer)
+    # OAuth tokens — minted by the "Connect with tone3000" login flow.
+    # Preferred over the secret key when present.
+    "tone3000_access_token": "",
+    "tone3000_refresh_token": "",
+    "tone3000_token_expires_at": 0,
+    "tone3000_username": "",
     "min_downloads": 50,
     "aggressive": False,
     # v3 auto-download knobs.
@@ -218,18 +234,92 @@ def _load_settings() -> dict:
     return _settings
 
 
+def _write_settings_file(data: dict) -> None:
+    """Persist settings to disk with owner-only permissions (0600).
+
+    The file holds tone3000 credentials (OAuth tokens and/or a secret key),
+    so we restrict it to the current OS user — other accounts on a shared
+    machine can't read it. Best-effort: chmod is a no-op on some platforms
+    (e.g. Windows), which is fine since the profile dir is already per-user."""
+    path = _config_dir / _SETTINGS_FILENAME
+    path.write_text(json.dumps(data, indent=2))
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def _save_settings(new_settings: dict) -> dict:
     global _settings, _t3k_client
     if _config_dir is None:
         raise RuntimeError("config_dir not available")
     current = _load_settings()
     merged = {**current, **new_settings}
-    (_config_dir / _SETTINGS_FILENAME).write_text(json.dumps(merged, indent=2))
+    _write_settings_file(merged)
     _settings = merged
     # Reset the cached client so a new key takes effect immediately.
     with _t3k_lock:
         _t3k_client = None
     return merged
+
+
+def _persist_tokens(updates: dict) -> None:
+    """Write a partial settings update straight to disk WITHOUT nulling the
+    cached client. Used as the tone3000 client's `on_tokens` callback: a
+    background refresh rotates the access/refresh token mid-request, and we
+    must not tear down the very client that's still using it (which is what
+    `_save_settings` would do)."""
+    global _settings
+    if _config_dir is None:
+        return
+    current = _load_settings()
+    current.update(updates)
+    try:
+        _write_settings_file(current)
+    except OSError:
+        log.warning("failed to persist tone3000 tokens", exc_info=True)
+    _settings = current
+
+
+def _safe_loopback_redirect(origin: str) -> str:
+    """Build the OAuth redirect_uri, HARD-RESTRICTED to a loopback address.
+
+    Security: the authorization code comes back to whatever redirect_uri we
+    request. By refusing anything but 127.0.0.1 / localhost we guarantee the
+    code can never be delivered off this machine, even if the `origin` query
+    param is tampered with by another local process. (tone3000 also rejects
+    unregistered redirect URIs, but we don't rely on that alone.) Anything
+    unexpected falls back to the default local server."""
+    from urllib.parse import urlparse
+    base = "http://127.0.0.1:18000"
+    try:
+        u = urlparse((origin or "").strip())
+        host = (u.hostname or "").lower()
+        if u.scheme in ("http", "https") and host in ("127.0.0.1", "localhost", "::1"):
+            base = f"{u.scheme}://{u.netloc}"
+    except Exception:
+        pass
+    return f"{base.rstrip('/')}/api/plugins/rig_builder/oauth/callback"
+
+
+def _oauth_result_page(message: str, ok: bool) -> str:
+    """Tiny self-contained page shown in the user's browser after the OAuth
+    redirect. The real state lives in the backend; this just tells the user
+    they can return to Slopsmith."""
+    color = "#34d399" if ok else "#f87171"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>TONE3000 — Rig Builder</title>"
+        "<style>body{background:#0f0f12;color:#e5e7eb;font-family:-apple-system,"
+        "Segoe UI,Roboto,sans-serif;display:flex;align-items:center;"
+        "justify-content:center;height:100vh;margin:0}"
+        ".card{max-width:420px;text-align:center;padding:2rem 2.5rem;"
+        "background:#17171c;border:1px solid #2a2a32;border-radius:16px}"
+        f"h1{{color:{color};font-size:1.1rem;margin:0 0 .5rem}}"
+        "p{color:#9ca3af;font-size:.9rem;line-height:1.5;margin:0}</style></head>"
+        f"<body><div class='card'><h1>{'Connected' if ok else 'Could not connect'}</h1>"
+        f"<p>{message}</p></div></body></html>"
+    )
 
 
 def _get_t3k_client():
@@ -264,6 +354,10 @@ def _get_t3k_client():
             _t3k_client = Tone3000Client(
                 cache_path,
                 api_key=settings.get("tone3000_api_key") or None,
+                access_token=settings.get("tone3000_access_token") or None,
+                refresh_token=settings.get("tone3000_refresh_token") or None,
+                token_expires_at=settings.get("tone3000_token_expires_at") or 0,
+                on_tokens=_persist_tokens,
             )
         return _t3k_client
 
@@ -1521,17 +1615,80 @@ def _list_library_songs() -> tuple[list[Path], int]:
     return songs, cloud_only
 
 
+def _existing_assignment_for_gear(rs_type: str) -> dict | None:
+    """Find a capture already assigned to this Rocksmith gear in ANY song's
+    preset, so a manual (or earlier auto) choice propagates library-wide
+    instead of the batch re-searching tone3000 from scratch.
+
+    Prefers hand-assigned pieces (so a manual choice spreads to the auto/
+    untouched songs), then the most recent. Returns a full piece-shaped dict
+    only if the capture still exists on disk; otherwise None (so a stale pick
+    falls back to a search)."""
+    if _config_dir is None:
+        return None
+    rows = _get_conn().execute(
+        """
+        SELECT kind, file, tone3000_id, vst_path, vst_format, vst_state
+        FROM preset_pieces
+        WHERE rs_gear_type = ? AND kind IN ('nam', 'ir', 'rs_ir', 'vst')
+              AND ((file IS NOT NULL AND file != '')
+                   OR (vst_path IS NOT NULL AND vst_path != ''))
+        ORDER BY (assigned_mode IN ('manual', 'manual_vst')) DESC, id DESC
+        """,
+        (rs_type,),
+    ).fetchall()
+    models_dir = _config_dir / "nam_models"
+    irs_dir = _config_dir / "nam_irs"
+    for kind, file, tone3000_id, vst_path, vst_format, vst_state in rows:
+        if kind == "vst":
+            if vst_path and Path(vst_path).exists():
+                return {"kind": "vst", "file": None, "tone3000_id": tone3000_id,
+                        "vst_path": vst_path, "vst_format": vst_format,
+                        "vst_state": vst_state}
+            continue
+        if not file:
+            continue
+        ok = (models_dir / file).exists() if kind == "nam" else (irs_dir / file).exists()
+        if ok:
+            return {"kind": kind, "file": file, "tone3000_id": tone3000_id}
+    return None
+
+
+def _manual_piece_usable(prev: dict) -> bool:
+    """True if a hand-assigned piece still points at something on disk, so the
+    batch can preserve it verbatim ("manual is sacred") instead of re-resolving."""
+    if _config_dir is None:
+        return False
+    kind = prev.get("kind")
+    if kind == "vst":
+        return bool(prev.get("vst_path")) and Path(prev["vst_path"]).exists()
+    f = prev.get("file")
+    if not f:
+        return False
+    if kind == "nam":
+        return (_config_dir / "nam_models" / f).exists()
+    if kind in ("ir", "rs_ir"):
+        return (_config_dir / "nam_irs" / f).exists()
+    return False
+
+
 def _batch_worker(mode: str = "all"):
     """Library-wide auto-assign: unique gear → tone3000 candidate (if
     API access) → recorded as 'pending' otherwise.
 
+    For each gear the capture is resolved in this order: (1) reuse a capture
+    already assigned to that gear in ANY song — so a manual choice in one song
+    propagates to every other song using it; (2) a bundled default capture;
+    (3) a fresh tone3000 search. Per-tone bypass and the chosen cab-IR variant
+    are always preserved across a re-run.
+
     `mode`:
-    - "all" — (re)map every tone. Re-resolves captures (preferring the
-      default-capture map) but **preserves** each tone's saved bypass and
-      chosen cab-IR variant, so a re-run refreshes tones without wiping
-      manual tweaks.
+    - "all" — (re)map every tone. Reuses existing per-gear assignments first,
+      so manual picks survive and spread; only genuinely-unassigned gear hits
+      tone3000.
     - "new" — only map tones that have NO preset yet; already-mapped tones
-      are left completely untouched.
+      are left completely untouched. New songs inherit the captures you've
+      already assigned to the same gear elsewhere.
     """
     global _batch_disk_bytes
     try:
@@ -1604,10 +1761,17 @@ def _batch_worker(mode: str = "all"):
                         # completely untouched.
                         continue
                     for _pr in _get_conn().execute(
-                        "SELECT rs_gear_type, bypassed, kind, file FROM preset_pieces WHERE preset_id = ?",
+                        "SELECT rs_gear_type, bypassed, kind, file, assigned_mode, "
+                        "tone3000_id, params_json, vst_path, vst_format, vst_state "
+                        "FROM preset_pieces WHERE preset_id = ?",
                         (_erow[0],),
                     ).fetchall():
-                        existing_by_gear[_pr[0]] = {"bypassed": bool(_pr[1]), "kind": _pr[2], "file": _pr[3]}
+                        existing_by_gear[_pr[0]] = {
+                            "bypassed": bool(_pr[1]), "kind": _pr[2], "file": _pr[3],
+                            "assigned_mode": _pr[4], "tone3000_id": _pr[5],
+                            "params_json": _pr[6], "vst_path": _pr[7],
+                            "vst_format": _pr[8], "vst_state": _pr[9],
+                        }
 
                 for piece in parsed["chain"]:
                     rs_type = piece["type"]
@@ -1616,6 +1780,32 @@ def _batch_worker(mode: str = "all"):
                     gears = info.get("tone3000_gears") or ""
                     query = info.get("tone3000_query") or rs_type
                     platform = _PLATFORM_FOR_CATEGORY.get(category, "nam")
+
+                    # 0. Manual is sacred. If the user hand-assigned this gear
+                    #    in THIS tone, keep it exactly as-is — the batch never
+                    #    overwrites a per-song manual choice. (Only reachable in
+                    #    "all" mode; "new" skips already-mapped tones entirely.)
+                    _prev_piece = existing_by_gear.get(rs_type, {})
+                    if (_prev_piece.get("assigned_mode") in ("manual", "manual_vst")
+                            and _manual_piece_usable(_prev_piece)):
+                        try:
+                            _kept_params = json.loads(_prev_piece.get("params_json") or "{}")
+                        except (ValueError, TypeError):
+                            _kept_params = piece["knobs"]
+                        pieces.append({
+                            "slot": piece["slot"],
+                            "rs_gear_type": rs_type,
+                            "kind": _prev_piece.get("kind") or "none",
+                            "file": _prev_piece.get("file"),
+                            "params": _kept_params,
+                            "tone3000_id": _prev_piece.get("tone3000_id"),
+                            "assigned_mode": _prev_piece.get("assigned_mode"),
+                            "bypassed": _prev_piece.get("bypassed", False),
+                            "vst_path": _prev_piece.get("vst_path"),
+                            "vst_format": _prev_piece.get("vst_format"),
+                            "vst_state": _prev_piece.get("vst_state"),
+                        })
+                        continue
 
                     # Cabs first: if we extracted a Rocksmith IR for
                     # this gear AND it's actually on disk, assign it.
@@ -1651,7 +1841,16 @@ def _batch_worker(mode: str = "all"):
                     candidate = seen_gears.get(rs_type)
                     if candidate is None:
                         candidate = {}
-                        if client.has_api_access and query:
+                        # 1. Reuse a capture already assigned to this gear in
+                        #    ANY song (manual choice → propagates library-wide).
+                        #    This is what makes "map all songs with the gear I
+                        #    selected" actually work without Export defaults.
+                        reused = _existing_assignment_for_gear(rs_type)
+                        if reused:
+                            candidate = reused
+                            _batch_log(f"reused existing {rs_type} → {reused.get('file')}")
+                        # 2. Otherwise resolve a fresh tone3000 candidate.
+                        elif client.has_api_access and query:
                             try:
                                 from tone3000_client import pick_top_candidate
                                 # Prefer a bundled default capture for this gear
@@ -1702,6 +1901,9 @@ def _batch_worker(mode: str = "all"):
                         "tone3000_id": candidate.get("tone3000_id"),
                         "assigned_mode": "auto",
                         "bypassed": existing_by_gear.get(rs_type, {}).get("bypassed", False),
+                        "vst_path": candidate.get("vst_path"),
+                        "vst_format": candidate.get("vst_format"),
+                        "vst_state": candidate.get("vst_state"),
                     })
 
                 _persist_preset_chain(
@@ -2136,8 +2338,10 @@ def setup(app, context):
             "rs_cab_to_ir_loaded": bool(rs_irs_map),
             "rs_cab_to_ir_count": len(rs_irs_map),
             "rs_irs_on_disk": rs_irs_on_disk,
-            "has_tone3000_key": bool(settings.get("tone3000_api_key")),
+            "has_tone3000_key": bool(settings.get("tone3000_api_key") or settings.get("tone3000_access_token")),
             "tone3000_api_works": client.has_api_access,
+            "tone3000_connected": bool(settings.get("tone3000_access_token")),
+            "tone3000_username": settings.get("tone3000_username") or "",
             "settings": {
                 "min_downloads": settings.get("min_downloads"),
                 "aggressive": settings.get("aggressive"),
@@ -2221,6 +2425,8 @@ def setup(app, context):
             "mega_chain_mode": s.get("mega_chain_mode", False),
             "has_tone3000_key": bool(key),
             "tone3000_api_key_preview": (key[:6] + "…") if key else "",
+            "tone3000_connected": bool(s.get("tone3000_access_token")),
+            "tone3000_username": s.get("tone3000_username") or "",
         }
 
     @app.post("/api/plugins/rig_builder/settings")
@@ -2236,6 +2442,95 @@ def setup(app, context):
         if "mega_chain_mode" in data:
             allowed["mega_chain_mode"] = bool(data["mega_chain_mode"])
         _save_settings(allowed)
+        return {"ok": True}
+
+    # ── OAuth (Connect with tone3000) ─────────────────────────────────
+    # The PKCE loopback flow for native apps: the UI opens the authorize
+    # URL in the system browser, the user logs in, tone3000 redirects back
+    # to this local server's /oauth/callback, and we exchange the code for
+    # tokens. No secret key ever touches the user's machine.
+
+    @app.get("/api/plugins/rig_builder/oauth/start")
+    def oauth_start(origin: str = ""):
+        client = _get_t3k_client()
+        verifier, challenge = client.generate_pkce()
+        state = secrets.token_urlsafe(24)
+        # redirect_uri returns the browser to THIS local server. The UI
+        # passes window.location.origin so we match whatever port uvicorn
+        # bound (default 127.0.0.1:18000, but findPort() may bump it).
+        # Hard-restricted to loopback — see _safe_loopback_redirect.
+        redirect_uri = _safe_loopback_redirect(origin)
+        now = time.time()
+        with _oauth_lock:
+            for k in [k for k, v in _oauth_pending.items()
+                      if now - v["created"] > _OAUTH_PENDING_TTL]:
+                _oauth_pending.pop(k, None)
+            _oauth_pending[state] = {
+                "verifier": verifier,
+                "redirect_uri": redirect_uri,
+                "created": now,
+            }
+        url = client.build_authorize_url(redirect_uri, challenge, state)
+        return {"authorize_url": url, "redirect_uri": redirect_uri}
+
+    @app.get("/api/plugins/rig_builder/oauth/callback")
+    def oauth_callback(code: str = "", state: str = "", error: str = ""):
+        if error:
+            return HTMLResponse(_oauth_result_page(
+                f"tone3000 reported: {error}. You can close this tab and try again.",
+                ok=False))
+        with _oauth_lock:
+            pending = _oauth_pending.pop(state, None)
+        if not pending or not code:
+            return HTMLResponse(_oauth_result_page(
+                "This sign-in link expired or was already used. "
+                "Return to Slopsmith and click Connect again.", ok=False))
+        client = _get_t3k_client()
+        try:
+            client.exchange_code(code, pending["verifier"], pending["redirect_uri"])
+        except Exception as e:
+            log.warning("oauth token exchange failed", exc_info=True)
+            return HTMLResponse(_oauth_result_page(
+                f"Token exchange failed: {e}", ok=False))
+        # exchange_code applied + persisted the tokens via on_tokens. Grab
+        # the username for display (best-effort).
+        username = ""
+        try:
+            user = client.get_user() or {}
+            username = user.get("username") or ""
+        except Exception:
+            pass
+        _persist_tokens({"tone3000_username": username})
+        # Rebuild the cached client so subsequent requests pick up the new
+        # tokens (they were applied in-place, but resetting is harmless and
+        # keeps the path identical to a settings change).
+        global _t3k_client
+        with _t3k_lock:
+            _t3k_client = None
+        return HTMLResponse(_oauth_result_page(
+            "You're connected to TONE3000. Close this tab and return to Slopsmith.",
+            ok=True))
+
+    @app.get("/api/plugins/rig_builder/oauth/status")
+    def oauth_status():
+        s = _load_settings()
+        return {
+            "connected": bool(s.get("tone3000_access_token")),
+            "username": s.get("tone3000_username") or "",
+            "has_secret": bool(s.get("tone3000_api_key")),
+        }
+
+    @app.post("/api/plugins/rig_builder/oauth/disconnect")
+    def oauth_disconnect():
+        _persist_tokens({
+            "tone3000_access_token": "",
+            "tone3000_refresh_token": "",
+            "tone3000_token_expires_at": 0,
+            "tone3000_username": "",
+        })
+        global _t3k_client
+        with _t3k_lock:
+            _t3k_client = None
         return {"ok": True}
 
     @app.get("/api/plugins/rig_builder/master_chain")

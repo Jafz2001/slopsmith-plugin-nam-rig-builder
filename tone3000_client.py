@@ -11,8 +11,11 @@ If the user later pastes a key into the plugin's settings, the same
 client switches into REST mode and the auto-suggest UI lights up.
 """
 
+import base64
+import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -23,6 +26,19 @@ from typing import Any
 
 BASE_URL = "https://www.tone3000.com/api/v1"
 WEB_BASE_URL = "https://www.tone3000.com"
+OAUTH_AUTHORIZE_URL = f"{BASE_URL}/oauth/authorize"
+OAUTH_TOKEN_URL = f"{BASE_URL}/oauth/token"
+
+_USER_AGENT = "slopsmith-tone-bridge/0.0.1"
+
+# Publishable key (OAuth client_id) for the Rig Builder integration. The
+# publishable key is designed to be embedded in client code — tone3000's
+# docs: "Safe to include in client-side code, mobile apps, and browser
+# environments." It only *identifies* the app in the OAuth flow; it cannot
+# read or download anything on its own (every API call needs the per-user
+# access token minted by the flow). Swap this for a dedicated "Rig Builder"
+# app's publishable key if/when one is registered.
+DEFAULT_PUBLISHABLE_KEY = "t3k_pub_bngrHev00no0ikJOb4KSy0xJ8Hovvh72"
 
 # Cache TTL: the tone catalog grows daily, but for our purposes a week
 # is plenty — captures don't change once uploaded, only new ones appear.
@@ -37,13 +53,36 @@ class Tone3000Client:
     library-wide batch hits the network at most once per unique gear.
     """
 
-    def __init__(self, cache_db_path: str, api_key: str | None = None, timeout: float = 15.0):
+    def __init__(
+        self,
+        cache_db_path: str,
+        api_key: str | None = None,
+        *,
+        access_token: str | None = None,
+        refresh_token: str | None = None,
+        token_expires_at: float = 0,
+        publishable_key: str | None = None,
+        on_tokens=None,
+        timeout: float = 15.0,
+    ):
+        # Two ways to authenticate, checked in this order:
+        #  1. OAuth access token (preferred — minted by a user login, short-
+        #     lived, refreshed automatically). Used as Bearer.
+        #  2. Secret key (`t3k_cs_…`) pasted by the user (advanced/legacy
+        #     server-to-server path). Also used as Bearer.
         self.api_key = api_key or os.environ.get("SLOPSMITH_TONE3000_KEY")
+        self.access_token = access_token or None
+        self.refresh_token = refresh_token or None
+        self.token_expires_at = float(token_expires_at or 0)
+        self.publishable_key = publishable_key or DEFAULT_PUBLISHABLE_KEY
+        # Called with a dict of settings keys whenever tokens change so the
+        # caller can persist them (access tokens rotate on every refresh).
+        self.on_tokens = on_tokens
         self.timeout = timeout
-        # A 401 from the search endpoint flips this flag. The UI uses
-        # it to switch from auto-mode to deep-link mode rather than
-        # making the user paste/edit a config file.
-        self.has_api_access = bool(self.api_key)
+        # A 401 we can't recover from flips this flag. The UI uses it to
+        # switch from auto-mode to deep-link mode rather than making the
+        # user paste/edit a config file.
+        self.has_api_access = bool(self.access_token or self.api_key)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(cache_db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -60,23 +99,171 @@ class Tone3000Client:
 
     # ── HTTP plumbing ───────────────────────────────────────────────
 
-    def _http_get(self, url: str) -> Any:
+    def _bearer(self) -> str | None:
+        """The token to send as `Authorization: Bearer`. OAuth access token
+        wins over the secret key when both are present."""
+        return self.access_token or self.api_key
+
+    def _raw_get(self, url: str) -> Any:
         req = urllib.request.Request(url)
         req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", "slopsmith-tone-bridge/0.0.1")
-        if self.api_key:
-            req.add_header("Authorization", f"Bearer {self.api_key}")
+        req.add_header("User-Agent", _USER_AGENT)
+        bearer = self._bearer()
+        if bearer:
+            req.add_header("Authorization", f"Bearer {bearer}")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _http_get(self, url: str) -> Any:
+        # Refresh proactively if the access token is about to expire, then
+        # do the request. A 401 still triggers a one-shot refresh + retry in
+        # case the server expired it early.
+        self._ensure_fresh_token()
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            return self._raw_get(url)
         except urllib.error.HTTPError as e:
             if e.code == 401:
+                if self.access_token and self._refresh_token():
+                    try:
+                        return self._raw_get(url)
+                    except urllib.error.HTTPError as e2:
+                        if e2.code == 401:
+                            self.has_api_access = False
+                            return None
+                        raise
+                # No recoverable credential — just means the user hasn't
+                # connected / pasted a key. The UI handles the fallback flow;
+                # callers see an empty payload.
                 self.has_api_access = False
-                # A 401 isn't a programming error — it just means the
-                # user hasn't supplied a key. The UI handles the
-                # fallback flow; callers see an empty payload.
                 return None
             raise
+
+    # ── OAuth (PKCE) ────────────────────────────────────────────────────
+
+    @staticmethod
+    def generate_pkce() -> tuple[str, str]:
+        """Return (code_verifier, code_challenge) for an OAuth PKCE flow.
+        Challenge = base64url(SHA-256(verifier)), no padding, per the spec."""
+        verifier = secrets.token_urlsafe(64)[:128]
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        return verifier, challenge
+
+    def build_authorize_url(
+        self,
+        redirect_uri: str,
+        code_challenge: str,
+        state: str,
+        *,
+        prompt: str | None = None,
+        gears: str | None = None,
+        platform: str | None = None,
+        login_hint: str | None = None,
+    ) -> str:
+        """Build the `/oauth/authorize` URL the user opens in their browser."""
+        params: dict[str, str] = {
+            "client_id": self.publishable_key,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+        if prompt:
+            params["prompt"] = prompt
+        if gears:
+            params["gears"] = gears
+        if platform:
+            params["platform"] = platform
+        if login_hint:
+            params["login_hint"] = login_hint
+        return f"{OAUTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+
+    def _post_token(self, body: dict) -> dict:
+        data = urllib.parse.urlencode(body).encode("ascii")
+        req = urllib.request.Request(OAUTH_TOKEN_URL, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", _USER_AGENT)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def exchange_code(self, code: str, code_verifier: str, redirect_uri: str) -> dict:
+        """Exchange an authorization code for tokens (called from the OAuth
+        callback). Applies + persists the resulting tokens."""
+        tokens = self._post_token({
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": code_verifier,
+            "redirect_uri": redirect_uri,
+            "client_id": self.publishable_key,
+        })
+        self._apply_tokens(tokens)
+        return tokens
+
+    def _ensure_fresh_token(self) -> None:
+        """Refresh the access token if it's missing/expiring within 60s."""
+        if not self.access_token or not self.refresh_token:
+            return
+        if self.token_expires_at and time.time() < self.token_expires_at - 60:
+            return
+        self._refresh_token()
+
+    def _refresh_token(self) -> bool:
+        """Use the refresh token to mint a new access token. Returns True on
+        success. On `invalid_grant` (refresh token expired) the tokens are
+        cleared so the UI prompts a re-connect."""
+        if not self.refresh_token:
+            return False
+        try:
+            tokens = self._post_token({
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token,
+                "client_id": self.publishable_key,
+            })
+        except urllib.error.HTTPError as e:
+            if e.code == 400:  # invalid_grant → refresh token expired
+                self._clear_tokens()
+            return False
+        except urllib.error.URLError:
+            return False
+        self._apply_tokens(tokens)
+        return True
+
+    def _apply_tokens(self, tokens: dict) -> None:
+        if tokens.get("access_token"):
+            self.access_token = tokens["access_token"]
+        # tone3000 rotates the refresh token on each exchange/refresh.
+        if tokens.get("refresh_token"):
+            self.refresh_token = tokens["refresh_token"]
+        expires_in = tokens.get("expires_in")
+        if expires_in:
+            self.token_expires_at = time.time() + float(expires_in)
+        self.has_api_access = bool(self.access_token or self.api_key)
+        self._emit_tokens()
+
+    def _clear_tokens(self) -> None:
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expires_at = 0
+        self.has_api_access = bool(self.api_key)
+        self._emit_tokens()
+
+    def _emit_tokens(self) -> None:
+        if not self.on_tokens:
+            return
+        try:
+            self.on_tokens({
+                "tone3000_access_token": self.access_token or "",
+                "tone3000_refresh_token": self.refresh_token or "",
+                "tone3000_token_expires_at": self.token_expires_at or 0,
+            })
+        except Exception:
+            pass
+
+    def get_user(self) -> dict | None:
+        """Currently authenticated user (id, username, …). Not cached."""
+        return self._http_get(f"{BASE_URL}/user")
 
     def _cached_get(self, url: str) -> Any:
         """GET with a sqlite cache. Stale entries are ignored, not removed —
@@ -160,10 +347,12 @@ class Tone3000Client:
         import os
         if os.path.exists(dest_path):
             return os.path.getsize(dest_path)
+        self._ensure_fresh_token()
         req = urllib.request.Request(model_url)
-        req.add_header("User-Agent", "slopsmith-tone-bridge/0.0.1")
-        if self.api_key:
-            req.add_header("Authorization", f"Bearer {self.api_key}")
+        req.add_header("User-Agent", _USER_AGENT)
+        bearer = self._bearer()
+        if bearer:
+            req.add_header("Authorization", f"Bearer {bearer}")
         # Stream to a temp path first; only rename into the final
         # name on success so a partial download doesn't leave a
         # corrupted file the dedup check would later accept.

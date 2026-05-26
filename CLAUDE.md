@@ -98,7 +98,14 @@ Key paths:
 
 ---
 
-## Current feature state (as of 2026-05-25)
+## Current feature state (as of 2026-05-26)
+
+> **v1.1.0 (2026-05-26):** tone3000 auth is now **OAuth 2.0 + PKCE** ("Connect
+> with tone3000" — no pasted secret key; secret-key UI removed but backend
+> still accepts one). Batch mapping is now **"manual is sacred, auto inherits"**
+> (`_batch_worker`). Added native **Browse…** file pickers for `gears.psarc`.
+> See the `HANDOFF.md` **v1.1.0** section (top) for the full detail + the
+> security rationale.
 
 All of the below is **plugin-only — no bundle edits**, so install is just
 "drop the folder + restart". See `HANDOFF.md` sections v3.5–v3.8 for detail.

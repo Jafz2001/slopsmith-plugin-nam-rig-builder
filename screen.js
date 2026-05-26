@@ -849,11 +849,16 @@ function rbRenderStatus() {
         return;
     }
     const cats = s.rs_to_real_by_category || {};
-    const apiLine = s.has_tone3000_key
-        ? (s.tone3000_api_works
+    let apiLine;
+    if (s.tone3000_connected) {
+        apiLine = `<span class="text-green-400">tone3000 connected${s.tone3000_username ? ' as ' + rbEsc(s.tone3000_username) : ''}</span>`;
+    } else if (s.has_tone3000_key) {
+        apiLine = s.tone3000_api_works
             ? '<span class="text-green-400">tone3000 API connected</span>'
-            : '<span class="text-red-400">tone3000 API key invalid</span>')
-        : '<span class="text-gray-500">no tone3000 API key (deep-link mode)</span>';
+            : '<span class="text-red-400">tone3000 key invalid</span>';
+    } else {
+        apiLine = '<span class="text-gray-500">not connected (deep-link mode)</span>';
+    }
     // Three states for the Rocksmith-IR line:
     //   1. JSON loaded + .wav files on disk → green, count of disk-resident IRs
     //   2. JSON loaded but no .wav (fresh install / no Rocksmith)  → yellow nudge
@@ -4893,25 +4898,65 @@ async function rbLoadSettings() {
     // sees it even if the user never opens Settings. rbLoadSettings is
     // called from rbInit so this runs at page-load.
     window.__rbMegaChainSetting = !!s.mega_chain_mode;
-    const status = document.getElementById('rb-api-key-status');
-    if (s.has_tone3000_key) {
-        status.innerHTML = `<span class="text-green-400">Key configured (${rbEsc(s.tone3000_api_key_preview)})</span>`;
+    // OAuth (Connect with tone3000) state.
+    const oauthStatus = document.getElementById('rb-oauth-status');
+    const oauthBtn = document.getElementById('rb-oauth-btn');
+    const oauthDisc = document.getElementById('rb-oauth-disconnect');
+    if (s.tone3000_connected) {
+        if (oauthStatus) oauthStatus.innerHTML = `<span class="text-green-400">Connected${s.tone3000_username ? ' as ' + rbEsc(s.tone3000_username) : ''}</span>`;
+        if (oauthBtn) oauthBtn.textContent = 'Reconnect';
+        if (oauthDisc) oauthDisc.classList.remove('hidden');
     } else {
-        status.textContent = 'No key. Deep-link mode active.';
+        if (oauthStatus) oauthStatus.textContent = 'Not connected.';
+        if (oauthBtn) oauthBtn.textContent = 'Connect with tone3000';
+        if (oauthDisc) oauthDisc.classList.add('hidden');
     }
 }
 
-async function rbSaveApiKey() {
-    const key = document.getElementById('rb-api-key').value.trim();
-    if (!key) return;
-    await fetch(`${RB_API}/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tone3000_api_key: key }),
-    });
-    document.getElementById('rb-api-key').value = '';
+// ── OAuth: Connect with tone3000 ────────────────────────────────────
+// Opens the authorize URL in the system browser (the host's nav guard
+// re-routes external URLs there), then polls until the backend has
+// exchanged the code for tokens.
+
+async function rbOauthConnect() {
+    const statusEl = document.getElementById('rb-oauth-status');
+    try {
+        const origin = window.location.origin;
+        const r = await fetch(`${RB_API}/oauth/start?origin=${encodeURIComponent(origin)}`);
+        const d = await r.json();
+        if (!d.authorize_url) throw new Error('no authorize URL');
+        window.open(d.authorize_url, '_blank');  // → system browser
+        if (statusEl) statusEl.textContent = 'Waiting for tone3000 sign-in in your browser…';
+        rbOauthPoll(0);
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Could not start sign-in: ' + (e.message || e);
+    }
+}
+
+async function rbOauthPoll(n) {
+    if (n > 90) {  // ~3 min, then give up quietly
+        const statusEl = document.getElementById('rb-oauth-status');
+        if (statusEl && statusEl.textContent.startsWith('Waiting')) {
+            statusEl.textContent = 'Still not connected. Finish sign-in in your browser, or click Connect again.';
+        }
+        return;
+    }
+    try {
+        const r = await fetch(`${RB_API}/oauth/status`);
+        const d = await r.json();
+        if (d.connected) {
+            rbLoadSettings();
+            rbInit();  // refresh status banner
+            return;
+        }
+    } catch (e) { /* keep polling */ }
+    setTimeout(() => rbOauthPoll(n + 1), 2000);
+}
+
+async function rbOauthDisconnect() {
+    await fetch(`${RB_API}/oauth/disconnect`, { method: 'POST' });
     rbLoadSettings();
-    rbInit();  // refresh status banner
+    rbInit();
 }
 
 async function rbSaveSettings() {
@@ -4928,6 +4973,27 @@ async function rbSaveSettings() {
     });
     // Mirror to the runtime so RbMegaChain picks it up without a restart.
     window.__rbMegaChainSetting = mega_chain_mode;
+}
+
+// Open a native file picker (Electron desktop bridge) and drop the chosen
+// path into the given text input. Falls back to manual entry when there's
+// no desktop bridge (e.g. running in a plain browser).
+async function rbBrowseForPsarc(inputId) {
+    const el = document.getElementById(inputId);
+    const picker = window.slopsmithDesktop && window.slopsmithDesktop.pickFile;
+    if (!picker) {
+        if (el) el.focus();
+        return;
+    }
+    try {
+        const path = await window.slopsmithDesktop.pickFile([
+            { name: 'Rocksmith gear archive', extensions: ['psarc'] },
+            { name: 'All Files', extensions: ['*'] },
+        ]);
+        if (path && el) el.value = path;  // null = user cancelled
+    } catch (e) {
+        console.error('[rig_builder] file picker failed:', e);
+    }
 }
 
 // Triggered from the Suggest modal: download a specific tone3000

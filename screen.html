@@ -164,19 +164,18 @@
     <!-- Settings -->
     <div id="rb-tab-settings" class="rb-tab-panel hidden">
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
-            <h3 class="text-white font-semibold mb-3">tone3000 API key</h3>
+            <h3 class="text-white font-semibold mb-3">Connect tone3000 account</h3>
             <p class="text-gray-500 text-sm mb-3">
-                The tone3000.com REST API requires authentication. Without a key,
-                the plugin runs in deep-link mode (buttons that open tone3000 in
-                your browser). With a key, candidates are listed in-app and the
-                batch auto-download mode is unlocked.
+                Sign in to tone3000 to list candidates in-app and unlock
+                automatic downloads — <strong>no API key to paste</strong>.
+                This opens tone3000 in your browser; you approve once and come
+                back. The plugin only receives a temporary, revocable token.
             </p>
-            <div class="flex gap-3 mb-3">
-                <input type="password" id="rb-api-key" placeholder="t3k_..."
-                       class="flex-1 bg-dark-800 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
-                <button onclick="rbSaveApiKey()" class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-sm transition">Save</button>
+            <div class="flex gap-3 items-center">
+                <button id="rb-oauth-btn" onclick="rbOauthConnect()" class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-sm transition">Connect with tone3000</button>
+                <button id="rb-oauth-disconnect" onclick="rbOauthDisconnect()" class="hidden bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Disconnect</button>
+                <span id="rb-oauth-status" class="text-xs text-gray-500"></span>
             </div>
-            <div id="rb-api-key-status" class="text-xs text-gray-500"></div>
         </div>
 
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
@@ -262,6 +261,34 @@
         </div>
 
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
+            <h3 class="text-white font-semibold mb-3">NAM model size (CPU vs realism)</h3>
+            <p class="text-gray-500 text-sm mb-3">
+                Picks which variant tone3000 downloads serve when multiple sizes
+                exist for the same capture. Smaller sizes load and render
+                <strong class="text-gray-300">much faster</strong> — relevant
+                because every mid-song tone change reloads the whole chain. If
+                you see audio spikes or lag on tone changes, switch to
+                <code class="bg-dark-800 px-1 rounded">feather</code> and
+                re-run <em>Batch all (mode: all)</em> on the Dashboard so the
+                existing songs grab the lighter models.
+            </p>
+            <label class="flex items-center gap-2 text-sm text-gray-300">
+                Preferred size:
+                <select id="rb-preferred-size" onchange="rbSaveSettings()"
+                        class="bg-dark-800 border border-gray-800 rounded px-2 py-1 text-sm">
+                    <option value="standard">standard (~12 MB · most realistic)</option>
+                    <option value="lite">lite (~3 MB · balanced)</option>
+                    <option value="feather">feather (~800 KB · fast tone switches)</option>
+                    <option value="nano">nano (~50 KB · lowest CPU, may sound thin)</option>
+                </select>
+            </label>
+            <p class="text-[11px] text-gray-500 mt-2 leading-snug">
+                Existing downloaded models are not changed. Only newly downloaded
+                captures (auto-download or batch) honour the new setting.
+            </p>
+        </div>
+
+        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
             <h3 class="text-white font-semibold mb-3">Regenerate gear map</h3>
             <p class="text-gray-500 text-sm mb-3">
                 If Rocksmith ships new gear or you want to re-extract after
@@ -271,6 +298,7 @@
             <div class="flex gap-3 mb-2">
                 <input type="text" id="rb-gears-psarc" placeholder="/path/to/gears.psarc"
                        class="flex-1 bg-dark-800 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+                <button onclick="rbBrowseForPsarc('rb-gears-psarc')" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Browse…</button>
                 <button onclick="rbExtractGearMap()" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Extract</button>
             </div>
             <div id="rb-extract-status" class="text-xs text-gray-500"></div>
@@ -288,6 +316,7 @@
             <div class="flex gap-3 mb-2">
                 <input type="text" id="rb-irs-psarc" placeholder="/path/to/gears.psarc"
                        class="flex-1 bg-dark-800 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+                <button onclick="rbBrowseForPsarc('rb-irs-psarc')" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Browse…</button>
                 <button onclick="rbExtractIRs()" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Extract</button>
             </div>
             <div id="rb-extract-irs-status" class="text-xs text-gray-500"></div>

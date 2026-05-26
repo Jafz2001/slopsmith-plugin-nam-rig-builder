@@ -1,3 +1,43 @@
+# Rig Builder 1.1.0 — sign in, don't paste keys (2026-05-26)
+
+This release removes the need to handle a sensitive tone3000 API key and makes
+the library-wide mapping behave the way you'd expect.
+
+## Headline changes
+
+- **🔐 Connect with tone3000 (OAuth login).** Instead of pasting an API key,
+  Settings now has a **Connect with tone3000** button: it opens tone3000 in
+  your browser, you approve once, and the plugin gets a temporary, revocable
+  token. **No secret key to copy or store.** This is tone3000's recommended
+  flow for plugins.
+  - Uses OAuth 2.0 with **PKCE** over a loopback redirect — the authorization
+    code can never leave your machine (the `redirect_uri` is hard-restricted
+    to `127.0.0.1`/`localhost`), `state` is validated against CSRF, and tokens
+    are stored owner-only (`0600`) and refreshed automatically.
+  - The old "paste a secret key" box was **removed** from the UI (the backend
+    still understands one for advanced/server use, but it's no longer shown).
+- **🧠 Smart library mapping — "manual is sacred, auto inherits".** The
+  Dashboard batch buttons now do what you'd expect:
+  - A piece you assign **by hand in one song is never overwritten** by the
+    batch — not even by *Remap all*. Per-song tweaks are safe.
+  - Songs you've **never touched inherit** the capture you assigned to that
+    same gear elsewhere — so configuring an amp once spreads it across the
+    library without redoing it per song or exporting defaults first.
+  - *Map new songs only* fills just the unmapped tones, inheriting your
+    existing per-gear choices; *Remap all* refreshes auto pieces while keeping
+    every manual pick.
+- **📂 Browse… buttons.** The *Regenerate gear map* and *Extract Rocksmith IRs*
+  settings now have a native **Browse…** file picker — no more typing the
+  `gears.psarc` path by hand.
+
+## Upgrade notes
+
+- After updating, **quit and reopen Slopsmith** (no hot reload).
+- Settings → **Connect with tone3000** to sign in. If you previously pasted an
+  API key it keeps working in the background, but signing in is preferred.
+
+---
+
 # Rig Builder 1.0.0 — first stable release (2026-05-25)
 
 The first stable release of **Rig Builder** (formerly `nam_rig_builder`). It

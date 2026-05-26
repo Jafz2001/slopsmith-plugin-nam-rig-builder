@@ -10,6 +10,87 @@ database schema, API quirks, what's done, what isn't, and why.
 
 ---
 
+## v1.1.0 (2026-05-26) — OAuth login + smart batch + file picker
+
+Three changes since the 1.0.0 release. All plugin-only.
+
+### tone3000 auth is now OAuth (no pasted secret)
+
+The user/testers were (rightly) wary of pasting a tone3000 **secret key**
+(`t3k_cs_…`) — tone3000's own docs say to treat it like a password and never
+put it on a user's device. tone3000 supports OAuth 2.0 + PKCE (the
+**publishable key** `t3k_pub_…` is safe to embed; it only identifies the app,
+the per-user access token does the work). So Settings now has **Connect with
+tone3000** instead of a key box.
+
+Flow (RFC 8252 loopback, fits this Electron app perfectly):
+
+1. `GET /oauth/start?origin=<window.location.origin>` → backend generates PKCE
+   `code_verifier` + `state` (kept in-memory in `_oauth_pending`, 10-min TTL),
+   builds the authorize URL, returns it.
+2. UI opens it with `window.open` → the host's nav-guard re-routes external
+   URLs to the **system browser** (same mechanism the deep-links already use).
+3. User signs in on tone3000 → redirected to
+   `http://127.0.0.1:<port>/api/plugins/rig_builder/oauth/callback` (the local
+   uvicorn server — the system browser can reach loopback).
+4. `/oauth/callback` validates `state`, exchanges `code`+verifier for tokens,
+   persists them, fetches the username, shows a "close this tab" page.
+5. UI polls `/oauth/status` until connected.
+
+**Security specifics (this was made mandatory — plugin ships to many users):**
+- `redirect_uri` is **hard-restricted to loopback** server-side
+  (`_safe_loopback_redirect`): a tampered `origin` can never send the auth code
+  off-machine. tone3000 also only honors *registered* redirect URIs.
+- **PKCE (S256)** → an intercepted code is useless without the verifier.
+- `state` validated → CSRF.
+- Settings file written **`0600`** (`_write_settings_file`) so other OS users
+  can't read tokens/secret.
+- Tokens auto-refresh (`Tone3000Client._refresh_token`); `_persist_tokens`
+  saves rotated tokens **without** nulling the live client.
+
+Client (`tone3000_client.py`): `Tone3000Client` now takes `access_token` /
+`refresh_token` / `token_expires_at` / `publishable_key` / `on_tokens`. Bearer
+= access token if present, else the secret. `generate_pkce`,
+`build_authorize_url`, `exchange_code`, `_refresh_token`, `get_user` added.
+`DEFAULT_PUBLISHABLE_KEY` is a placeholder = the dev's personal publishable
+key — **register a dedicated "Rig Builder" OAuth app + its loopback
+redirect_uri with tone3000 before wide release** (see "Open" below).
+
+The **secret-key UI was removed** from Settings (the backend still accepts
+`tone3000_api_key` as a fallback, just not shown). New settings keys:
+`tone3000_access_token`, `tone3000_refresh_token`, `tone3000_token_expires_at`,
+`tone3000_username`.
+
+### Batch: "manual is sacred, auto inherits"
+
+Testers expected "map all songs with the gear I selected" but a manual choice
+in one song didn't propagate, and `Remap all` could clobber manual picks. New
+per-gear resolution order in `_batch_worker`:
+
+0. **Manual is sacred** — if the *current* tone has a hand-assigned
+   (`assigned_mode in manual/manual_vst`) piece for this gear that's still on
+   disk, keep it **verbatim** (incl. VST path/format/state). Never overwritten.
+1. Rocksmith cab IR on disk (unchanged).
+2. **Reuse** a capture already assigned to this gear in **any** song
+   (`_existing_assignment_for_gear`, manual preferred) → so a manual pick
+   spreads to the auto/untouched songs.
+3. `default_captures.json`.
+4. tone3000 search.
+
+`_manual_piece_usable` gates step 0; `existing_by_gear` now loads the full
+piece (assigned_mode, tone3000_id, params, vst fields). `Map new` still skips
+already-mapped tones entirely; `Remap all` refreshes auto pieces but preserves
+all manual ones.
+
+### Native file picker
+
+`Browse…` buttons next to the two `gears.psarc` inputs (Regenerate gear map,
+Extract Rocksmith IRs) call `window.slopsmithDesktop.pickFile([...])` (the
+host's `dialog:pickFile` IPC — same one `audio_engine` uses) →
+`rbBrowseForPsarc`. Degrades to manual entry if no desktop bridge.
+
+---
+
 ## What the user wanted
 
 Take Rocksmith tones (amp, cab, pedals, racks already exposed by the
