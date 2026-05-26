@@ -337,6 +337,12 @@ const RbMegaChain = (function () {
     let _activeToneKey = null; // tone_key currently un-bypassed
     let _pollHandle = null;    // setInterval handle watching highway tone changes
     let _duckedStems = null;   // saved gain nodes to restore on teardown
+    // Map from chain-array INDEX (what the backend gives us in
+    // active_slots, master_pre_indices etc.) to the ENGINE'S slot ID
+    // (what setBypass/setMultiBypass actually uses). The two are not the
+    // same — the engine assigns its own IDs during loadPreset. We capture
+    // them via getChainState() right after loading.
+    let _indexToSlotId = [];   // chain index → engine slotId
 
     function _settingOn() {
         if (window.__rbMegaChain === false) return false;
@@ -416,8 +422,13 @@ const RbMegaChain = (function () {
     // union of (master_pre ∪ active tone's active_slots ∪ master_post)
     // and bypass everything NOT in that set.
     //
-    // Uses setMultiBypass when available (one IPC call) — otherwise falls
-    // back to per-slot setBypass.
+    // The backend gives us chain INDICES (0..N-1 in chain-array order),
+    // but setBypass/setMultiBypass want the engine's actual slot IDs,
+    // which loadPreset assigns dynamically. We translate via the
+    // _indexToSlotId map captured right after loadPreset returned. If
+    // the map is missing (e.g. engine returned no chain state) we fall
+    // back to assuming index == slotId, but the user will probably hear
+    // the wrong stages active in that case.
     async function _applyActiveTone(activeToneKey) {
         const api = _api();
         if (!api || !_mega) return;
@@ -435,8 +446,10 @@ const RbMegaChain = (function () {
         }
 
         const changes = [];
-        for (let slotId = 0; slotId < totalStages; slotId++) {
-            changes.push({ slotId, bypassed: !active.has(slotId) });
+        const mapLen = _indexToSlotId.length;
+        for (let idx = 0; idx < totalStages; idx++) {
+            const slotId = (idx < mapLen && _indexToSlotId[idx] != null) ? _indexToSlotId[idx] : idx;
+            changes.push({ slotId, bypassed: !active.has(idx) });
         }
         try {
             if (typeof api.setMultiBypass === 'function') {
@@ -521,6 +534,29 @@ const RbMegaChain = (function () {
                 + ` for "${filename}" — ${mega.tones.length} tones`
                 + ` (master ${mega.master_pre_count}+${mega.master_post_count}, ${savings}% deduped)`,
                 res);
+            // Capture the engine's actual slot IDs so _applyActiveTone can
+            // bypass the right ones. setBypass uses ENGINE slot IDs, not
+            // chain-array indices — and the engine assigns its own IDs
+            // during loadPreset (verified: slot.id and slot.slotId in the
+            // getChainState() response, mirroring rbReapplyVstParamsToChain).
+            // Without this map every bypass call used wrong IDs and the
+            // user heard a random mix of stages active.
+            _indexToSlotId = [];
+            try {
+                if (typeof api.getChainState === 'function') {
+                    const loaded = await api.getChainState();
+                    if (Array.isArray(loaded)) {
+                        for (let i = 0; i < loaded.length; i++) {
+                            const s = loaded[i];
+                            const id = (s && (s.id != null ? s.id : s.slotId != null ? s.slotId : i));
+                            _indexToSlotId[i] = id;
+                        }
+                        console.log(`[rig_builder mega-chain] captured ${_indexToSlotId.length} slot IDs (engine assigned IDs vs chain index — first 5: ${_indexToSlotId.slice(0, 5).join(',')}…)`);
+                    }
+                }
+            } catch (e) {
+                console.warn('[rig_builder mega-chain] getChainState failed:', e);
+            }
             // VST params: walk the freshly-loaded mega-chain and dispatch
             // setParameter so VSTs come up at their saved values, not the
             // plug-in defaults. Without this users had to open each VST
@@ -652,6 +688,7 @@ const RbMegaChain = (function () {
         _active = false;
         _mega = null;
         _activeToneKey = null;
+        _indexToSlotId = [];
     }
 
     function isActive() { return _active; }
