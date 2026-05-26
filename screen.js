@@ -95,10 +95,22 @@
     };
 })();
 
-// Mute everything the engine can mute, hold for long enough that the
-// bundle's clearChain + loadPreset (multi-NAM standard ≈ 100-250 ms) runs
-// at silence, then restore. Called from the fetch interceptor right
-// before the bundle pulls the preset JSON.
+// Mute everything the engine can mute just long enough that the bundle's
+// clearChain + loadPreset runs at silence, then restore with a short
+// fade-in so the un-mute doesn't pop. Called from the fetch interceptor
+// right before the bundle pulls the preset JSON, and from rbListenTone
+// / rbReloadPreview right before clearChain.
+//
+// Hold-time tuning (assumes `feather`-size NAMs, the recommended setting):
+//   feather load ≈ 5-15 ms per stage. We give 15 ms/stage + 30 ms baseline
+//   so a 4-NAM chain = 90 ms, a 6-NAM chain = 120 ms. Smaller than the
+//   first version (which was sized for `standard` NAMs at 80+50/stage =
+//   380 ms for 6 stages, which felt like a noticeable audio drop-out).
+//   Users on `standard` size can override via `window.__rbMutePreLoadHold`.
+//
+// Fade-in instead of instant restore so the chain-gain transition from 0
+// to 1.0 doesn't click. 4 steps over 24 ms (≈ 5 audio buffers at 256
+// samples / 48 kHz) sounds like a gentle swell, not a switch.
 let _rbMuteInFlight = false;
 async function rbPreLoadMute(chainLen) {
     if (window.__rbMutePreLoad === false) return;
@@ -106,12 +118,9 @@ async function rbPreLoadMute(chainLen) {
     _rbMuteInFlight = true;
     const audio = window.slopsmithDesktop && window.slopsmithDesktop.audio;
     if (!audio) { _rbMuteInFlight = false; return; }
-    // Hold-time scales with chain length: every NAM that needs to load
-    // contributes a fixed slice of CPU stall. Conservative bound:
-    // 80 ms baseline + 50 ms per NAM stage. With chainLen=6 → ~380 ms.
-    const hold = 80 + 50 * Math.max(1, chainLen | 0);
-    // Snapshot the input-monitor state so we don't un-mute something
-    // the user explicitly muted in a different plugin.
+    const hold = (typeof window.__rbMutePreLoadHold === 'number')
+        ? Math.max(20, window.__rbMutePreLoadHold | 0)
+        : 30 + 15 * Math.max(1, chainLen | 0);
     let wasMuted = false;
     try { if (typeof audio.isMonitorMuted === 'function') wasMuted = !!(await audio.isMonitorMuted()); } catch (_) {}
     try {
@@ -122,8 +131,18 @@ async function rbPreLoadMute(chainLen) {
     } catch (_) {}
     setTimeout(async () => {
         try {
-            if (typeof audio.setGain === 'function') await audio.setGain('chain', 1.0);
+            // Un-mute the monitor immediately (it's a hard mute, no transient).
             if (!wasMuted && typeof audio.setMonitorMute === 'function') await audio.setMonitorMute(false);
+            // Fade chain gain 0 → 1.0 over ~24 ms in 4 steps so the
+            // restore doesn't click. The audio thread sees each step
+            // as a discrete value, but ear-perceived it's a smooth swell.
+            if (typeof audio.setGain === 'function') {
+                const steps = [0.25, 0.5, 0.8, 1.0];
+                for (const v of steps) {
+                    await audio.setGain('chain', v);
+                    await new Promise(r => setTimeout(r, 6));
+                }
+            }
         } catch (_) {}
         _rbMuteInFlight = false;
     }, hold);
