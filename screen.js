@@ -3307,6 +3307,10 @@ function rbRenderVstPanelBody(toneIdx, pIdx, currentVstPath, currentFormat) {
                    class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-300 px-2 py-1 font-mono">
         </div>
         <div id="rb-vst-selected-${toneIdx}-${pIdx}" class="text-[10px] text-purple-200/80 break-all">Selected: ${rbEsc(stagedName)}</div>
+        <div class="text-[10px] text-gray-500 leading-snug">
+            Path also supports <code>.component</code> (Audio Units). Pasting a full
+            path auto-assigns; using the file picker requires clicking <strong class="text-purple-200">✓ Use this VST</strong> below.
+        </div>
         <div class="flex items-center gap-2 flex-wrap">
             <button onclick="rbLoadAndEditVst(${toneIdx}, ${pIdx})"
                     class="bg-blue-700 hover:bg-blue-600 text-white text-xs px-2 py-1 rounded">
@@ -3427,12 +3431,26 @@ function rbStagePath(toneIdx, pIdx, path) {
 
 // Stage from the manual path input AND update the "Selected" display
 // without re-rendering the whole panel (keeps the text cursor in the input).
+// Also auto-assigns the VST when the user finished typing a real path
+// (.vst3 or .component) — saves the explicit "✓ Use this VST" click
+// in the common case where you already know the path you want. Picking
+// from the dropdown or file picker still requires the Assign button so
+// accidental clicks don't override your current pick.
 function rbUpdatePathFromInput(toneIdx, pIdx, path) {
     rbStagePath(toneIdx, pIdx, path);
     const sel = document.getElementById(`rb-vst-selected-${toneIdx}-${pIdx}`);
     if (sel) {
         const name = (path || '').split('/').pop() || '(none selected)';
         sel.textContent = `Selected: ${name}`;
+    }
+    // Auto-assign when the user pasted/typed a real plugin path. Heuristic:
+    // ends with .vst3 or .component AND looks like an absolute filesystem
+    // path (starts with /). Anything else is half-typed and we leave it
+    // as a stage for now.
+    const looksReady = /^\/.+\.(vst3|component)$/i.test((path || '').trim());
+    if (looksReady) {
+        rbAssignVst(toneIdx, pIdx).catch((e) =>
+            console.warn('[rig_builder] auto-assign VST from path input failed:', e));
     }
 }
 
