@@ -3611,12 +3611,22 @@ async function rbReloadPreview(refetchPresetId) {
     const payload = rbState._previewPayload;
     if (!payload) return;
     rbApplyBypassToChain(payload, rbState.listeningTone);
+    const chainLen = (payload.native_preset.chain && payload.native_preset.chain.length) || 1;
     try {
+        // Same pre-load mute used by the fetch interceptor for the bundle's
+        // tone-change path: zero chain gain + mute monitor BEFORE clearChain,
+        // so the first audio buffer after loadPreset (which carries the NAM
+        // attack transient) runs silently. The chain gain restores itself
+        // to 1.0 inside rbPreLoadMute on a timer scaled to chain length.
+        rbPreLoadMute(chainLen).catch(() => {});
         if (api.clearChain) await api.clearChain().catch(() => {});
         await api.loadPreset(JSON.stringify(payload.native_preset));
         // Engine sometimes leaves a slot bypassed across reloads — force each
         // slot's bypass to match the spec so toggling un-bypass actually un-bypasses.
         await rbReapplyBypassToChain(api, payload.native_preset.chain || []);
+        // Note: rbPreLoadMute restores setMonitorMute(false) on its own
+        // timer, but we also explicitly unmute here in case the timer
+        // hasn't fired yet — the chain is now safely loaded.
         if (api.setMonitorMute) await api.setMonitorMute(false).catch(() => {});
     } catch (e) { console.warn('[rig_builder] reload preview failed', e); }
 }
@@ -4258,6 +4268,12 @@ async function rbListenTone(toneIdx, filename) {
             }
             rbState._previewPayload = payload;
             rbApplyBypassToChain(payload, toneIdx);   // honour any pre-set bypasses
+            // Pre-load mute (same as the fetch interceptor uses for the
+            // bundle's tone-change path): zero chain gain + mute monitor
+            // BEFORE clearChain so the loadPreset attack transient runs
+            // silently. rbPreLoadMute restores on its own timer scaled
+            // to chain length.
+            rbPreLoadMute(chain.length).catch(() => {});
             if (api.clearChain) await api.clearChain().catch(() => {});
             const res = await api.loadPreset(JSON.stringify(payload.native_preset));
             const got = res && res.slotsLoaded;
