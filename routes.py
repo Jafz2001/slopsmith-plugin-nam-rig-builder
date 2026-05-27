@@ -5216,10 +5216,28 @@ def setup(app, context):
                     "vst_state": vst_state,
                 }
 
+        # Pattern-based category fallback for gears that lack an
+        # `rs_to_real.json` entry. `extract_gear_map.py` doesn't emit
+        # cab gears (they're handled by `rs_cab_to_ir.json`), so 49
+        # cab codenames in this user's library landed in "Other"
+        # before. Use the codename prefix to recover the category —
+        # works for the canonical RS naming convention.
+        def _category_from_codename(gear: str) -> str:
+            g = (gear or "").lower()
+            if g.startswith("bass_cab_") or g.startswith("cab_") or g == "cabinets":
+                return "cab"
+            if g.startswith("bass_pedal_") or g.startswith("pedal_") or g == "pedals":
+                return "pedal"
+            if g.startswith("rack_") or g == "racks":
+                return "rack"
+            if g.startswith("bass_amp_") or g.startswith("amp_"):
+                return "amp"
+            return "other"
+
         cats: dict[str, list] = {}
         for gear, b in best.items():
             info = rs_map.get(gear) or {}
-            category = info.get("category") or "other"
+            category = info.get("category") or _category_from_codename(gear)
             t3kid = b["tone3000_id"]
             meta = img_idx.get(t3kid) if t3kid else None
             cats.setdefault(category, []).append({
