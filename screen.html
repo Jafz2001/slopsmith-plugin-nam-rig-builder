@@ -271,28 +271,26 @@
             </label>
         </div>
 
-        <div class="bg-dark-700/50 border border-amber-800/40 rounded-xl p-5 mb-6">
+        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
             <h3 class="text-white font-semibold mb-3">
-                Chain preloader <span class="text-amber-400 text-xs ml-2">EXPERIMENTAL</span>
+                Chain preloader <span class="text-emerald-400 text-xs ml-2">DEFAULT</span>
             </h3>
             <p class="text-gray-500 text-sm mb-3">
                 Pre-loads every tone of the song into one big chain at song start,
                 then switches between tones by toggling bypass instead of reloading
                 NAMs. <strong class="text-gray-300">Eliminates the tone-change spike
-                completely</strong> (no mute/fade workaround needed) at the cost of
-                higher steady-state memory and CPU — every NAM stays loaded.
-                Recommended only on M1/M2/M3 with <code class="bg-dark-800 px-1 rounded">feather</code>
-                or <code class="bg-dark-800 px-1 rounded">nano</code> models.
+                completely</strong>. Steady-state memory is higher (every NAM stays
+                loaded) but on M-series Macs the trade-off is clear-cut.
             </p>
-            <p class="text-amber-300 text-xs mb-3 leading-snug">
-                ⚠️ Requires <strong>AMP off</strong> on the song player — Rig Builder
-                drives the engine directly in this mode. If it misbehaves, turn it off
-                here and you're back to the cooperative path. Kill-switch in DevTools:
+            <p class="text-gray-400 text-xs mb-3 leading-snug">
+                Turn it off if you're on a weak x86 laptop and hear crackling, or if
+                a specific song is misbehaving — playback then falls back to the
+                cooperative load/unload path. Kill-switch in DevTools:
                 <code class="bg-dark-900 px-1 rounded">window.__rbMegaChain = false</code>.
             </p>
             <label class="flex items-center gap-2 text-sm text-gray-300">
                 <input type="checkbox" id="rb-mega-chain-mode" onchange="rbSaveSettings()" class="rounded">
-                Enable chain preloader
+                Enable chain preloader (default)
             </label>
         </div>
 

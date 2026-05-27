@@ -141,7 +141,13 @@ _DEFAULT_SETTINGS = {
     # loaded). Requires the bundle's AMP to be off (we drive the engine
     # ourselves). Roll out only after the cooperative mute-parche flow is
     # confirmed stable on the user's hardware.
-    "mega_chain_mode": False,
+    # Chain preloader is now the default playback path (2026-05-28).
+    # Eliminates the tone-change spike entirely by holding every tone's
+    # stages in memory and toggling bypass between them, instead of
+    # reload + clearChain on every switch. Memory cost is a few MB per
+    # extra NAM but on M-series Macs it's a clear win. Users on weak
+    # x86 hardware can flip it off in Settings.
+    "mega_chain_mode": True,
     # NAM loudness normalization. Each .nam carries an integrated LUFS
     # value in its JSON header; we read it and apply a per-stage
     # `outputLevel` so every NAM lands at `target_lufs`, eliminating
@@ -3680,7 +3686,7 @@ def setup(app, context):
             "min_downloads": s.get("min_downloads", 50),
             "aggressive": s.get("aggressive", False),
             "preferred_size": s.get("preferred_size", "standard"),
-            "mega_chain_mode": s.get("mega_chain_mode", False),
+            "mega_chain_mode": s.get("mega_chain_mode", True),
             "bypass_all_cabs": s.get("bypass_all_cabs", False),
             "has_tone3000_key": bool(key),
             "tone3000_api_key_preview": (key[:6] + "…") if key else "",

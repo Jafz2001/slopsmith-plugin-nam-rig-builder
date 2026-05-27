@@ -367,8 +367,9 @@ const NAM_API = '/api/plugins/nam_tone';
 
 // ── RbMegaChain: pre-loaded whole-song chain with bypass-flip switching
 //
-// EXPERIMENTAL — guarded by `mega_chain_mode` Setting + runtime kill-switch
-// `window.__rbMegaChain = false`. Replaces the bundle's clearChain +
+// DEFAULT playback path (2026-05-28). Toggle in Settings → "Chain
+// preloader" or via the runtime kill-switch `window.__rbMegaChain =
+// false`. Replaces the bundle's clearChain +
 // loadPreset cycle on every tone change with a single loadPreset at song
 // load + setBypass(slot_range, on/off) on each tone change. Result: zero
 // tone-change transient (no spike, no mute parche needed) at the cost of
