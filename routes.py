@@ -153,8 +153,13 @@ _DEFAULT_SETTINGS = {
     # `outputLevel` so every NAM lands at `target_lufs`, eliminating
     # the volume jumps when switching between amps captured at
     # different levels. Capped to ±12 dB inside `_nam_normalized_output_level`.
+    # Target −6 LUFS (was −18): pushes the instrument up so it sits well against
+    # the backing. Baked per-stage into the chain (mega_chain / native_preset_full),
+    # so unlike the live chain gain (engine-clamped at +12 dB) it isn't clamped.
+    # A typical −18 LUFS capture reaches −6 (+12 dB = ×4 cap); quieter ones top
+    # out at ×4.
     "normalize_nam_loudness": True,
-    "nam_loudness_target_lufs": -18.0,
+    "nam_loudness_target_lufs": -6.0,
     # When toggled, bypasses (or un-bypasses) the cabinet slot on EVERY song's
     # tones in one shot — for users who'd rather run no cab (raw amp) or their
     # own external cab sim. Stored just for the checkbox state; the actual
@@ -564,7 +569,7 @@ def _nam_normalized_output_level(path: Path) -> float:
     loudness = _nam_loudness_for_path(path)
     if loudness is None:
         return 1.0
-    target = float(settings.get("nam_loudness_target_lufs", -18.0))
+    target = float(settings.get("nam_loudness_target_lufs", -6.0))
     makeup_db = target - loudness
     makeup_db = max(-12.0, min(12.0, makeup_db))
     return 10.0 ** (makeup_db / 20.0)
@@ -3925,6 +3930,15 @@ def setup(app, context):
             "SELECT tone_key, preset_id FROM tone_mappings WHERE filename = ?",
             (filename,),
         ).fetchall()
+        # tone_mappings are keyed by basename; if the song was opened with a
+        # subdir prefix (e.g. "sloppak/<name>") the exact match misses and the
+        # editor would wrongly show every tone as unmapped. Retry on basename.
+        _base = filename.rsplit("/", 1)[-1]
+        if not existing_rows and _base != filename:
+            existing_rows = conn.execute(
+                "SELECT tone_key, preset_id FROM tone_mappings WHERE filename = ?",
+                (_base,),
+            ).fetchall()
         existing_by_key = {r[0]: r[1] for r in existing_rows}
 
         _img_idx = _tone_image_index()
@@ -4413,7 +4427,7 @@ def setup(app, context):
         }
 
     # ── Experimental: mega-chain for a whole song ────────────────────
-    @app.get("/api/plugins/rig_builder/mega_chain/{filename}")
+    @app.get("/api/plugins/rig_builder/mega_chain/{filename:path}")
     def mega_chain_for_song(filename: str):
         """Build a single chain that contains EVERY tone of this song,
         plus the master pre/post chain wrapping it. Returns slot ranges
@@ -4438,13 +4452,24 @@ def setup(app, context):
             decoded = filename
 
         conn = _get_conn()
-        mappings = conn.execute(
-            "SELECT tm.tone_key, tm.preset_id, p.name, p.input_gain, p.output_gain, "
-            "       p.gate_threshold "
-            "FROM tone_mappings tm JOIN presets p ON tm.preset_id = p.id "
-            "WHERE tm.filename = ? ORDER BY tm.id ASC",
-            (decoded,),
-        ).fetchall()
+
+        def _lookup(name: str):
+            return conn.execute(
+                "SELECT tm.tone_key, tm.preset_id, p.name, p.input_gain, p.output_gain, "
+                "       p.gate_threshold "
+                "FROM tone_mappings tm JOIN presets p ON tm.preset_id = p.id "
+                "WHERE tm.filename = ? ORDER BY tm.id ASC",
+                (name,),
+            ).fetchall()
+
+        mappings = _lookup(decoded)
+        # The host plays songs with a subdir prefix (e.g. "sloppak/<name>")
+        # while tone_mappings are keyed by basename — the exact match then
+        # misses and the song plays the raw DI (no chain). Retry on the
+        # basename so a prefixed path still resolves its tones.
+        base = decoded.rsplit("/", 1)[-1]
+        if not mappings and base != decoded:
+            mappings = _lookup(base)
         if not mappings:
             return JSONResponse(
                 {"error": f"no tone mappings for {decoded}",
