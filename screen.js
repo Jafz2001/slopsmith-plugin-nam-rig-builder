@@ -488,7 +488,12 @@ const RbMegaChain = (function () {
         const changes = [];
         const mapLen = _indexToSlotId.length;
         for (let idx = 0; idx < totalStages; idx++) {
-            const slotId = (idx < mapLen && _indexToSlotId[idx] != null) ? _indexToSlotId[idx] : idx;
+            // Skip chain indices whose stage failed to load (slot ID is
+            // null in the map). Firing setBypass with the raw index as
+            // fallback would hit the WRONG slot in the engine since
+            // engine IDs aren't sequential 0..N-1.
+            if (idx >= mapLen || _indexToSlotId[idx] == null) continue;
+            const slotId = _indexToSlotId[idx];
             changes.push({ slotId, bypassed: bypassByIdx[idx] });
         }
         try {
@@ -598,7 +603,19 @@ const RbMegaChain = (function () {
                             const id = (s && (s.id != null ? s.id : s.slotId != null ? s.slotId : i));
                             _indexToSlotId[i] = id;
                         }
-                        console.log(`[rig_builder mega-chain] captured ${_indexToSlotId.length} slot IDs (engine assigned IDs vs chain index — first 5: ${_indexToSlotId.slice(0, 5).join(',')}…)`);
+                        const expected = mega.native_preset.chain.length;
+                        const got = _indexToSlotId.length;
+                        if (got !== expected) {
+                            // The engine couldn't load every stage we sent. Likely a
+                            // missing file or a malformed plugin. Mark the unreachable
+                            // chain indices as null so _applyActiveTone skips them
+                            // rather than firing setBypass on the WRONG slot ID via
+                            // the index-as-fallback path.
+                            const skipped = expected - got;
+                            console.warn(`[rig_builder mega-chain] STAGE LOAD MISMATCH: sent ${expected} stages but engine reported only ${got} — ${skipped} stage(s) failed to load. Likely culprit: missing NAM/IR file, malformed VST, or a path that no longer exists. The remaining ${skipped} chain index/indices will be skipped in bypass updates so we don't fire setBypass on the wrong slot.`);
+                            for (let i = got; i < expected; i++) _indexToSlotId[i] = null;
+                        }
+                        console.log(`[rig_builder mega-chain] captured ${got} slot IDs (engine assigned IDs vs chain index — first 5: ${_indexToSlotId.slice(0, 5).join(',')}…)`);
                     }
                 }
             } catch (e) {
