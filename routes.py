@@ -5265,12 +5265,57 @@ def setup(app, context):
                 return "amp"
             return "other"
 
+        # Enumerate curated gain_variants for amps so the UI can render
+        # one ▶ button per variant (clean/crunch/dist) in the gear card.
+        # The on-disk filename for each variant is derived the same way
+        # `_wire_curated_variants_to_presets` finds it — try the
+        # readable-from-notes path first, then the legacy cryptic name.
+        # Output: list of {level, file, kind, notes, model_id, rs_gain_range}
+        # per variant whose NAM is actually on disk. Variants whose file
+        # is missing get marked `available: false` so the UI can dim
+        # the button instead of trying to audition nothing.
+        def _variants_for(rs_gear: str, info: dict) -> list[dict]:
+            out = []
+            variants = info.get("gain_variants") or {}
+            if not variants or _config_dir is None:
+                return out
+            subdir = _category_subdir_for_gear(rs_gear)
+            amp_dir = _config_dir / "nam_models" / subdir
+            for level, spec in variants.items():
+                if not isinstance(spec, dict):
+                    continue
+                title = (spec.get("notes") or "").strip()
+                model_id = spec.get("model_id")
+                tone_id = spec.get("tone3000_id")
+                rel = None
+                if title:
+                    candidate = amp_dir / f"{_safe_filename_human(title)}.nam"
+                    if candidate.exists():
+                        rel = f"{subdir}/{candidate.name}"
+                if rel is None and model_id and tone_id:
+                    legacy_name = (f"tone3000_{tone_id}_m{model_id}_"
+                                   f"{_safe_filename(rs_gear)}.nam")
+                    if (amp_dir / legacy_name).exists():
+                        rel = f"{subdir}/{legacy_name}"
+                out.append({
+                    "level": level,
+                    "file": rel,
+                    "kind": "nam",
+                    "available": rel is not None,
+                    "notes": title,
+                    "model_id": model_id,
+                    "tone3000_id": tone_id,
+                    "rs_gain_range": spec.get("rs_gain_range"),
+                })
+            return out
+
         cats: dict[str, list] = {}
         for gear, b in best.items():
             info = rs_map.get(gear) or {}
             category = info.get("category") or _category_from_codename(gear)
             t3kid = b["tone3000_id"]
             meta = img_idx.get(t3kid) if t3kid else None
+            variants = _variants_for(gear, info) if category == "amp" else []
             cats.setdefault(category, []).append({
                 "rs_gear": gear,
                 "real_name": info.get("name") or gear,
@@ -5292,6 +5337,9 @@ def setup(app, context):
                 # gears.psarc). Missing for gears we couldn't find in
                 # the manifest — sorted last in that case.
                 "rs_order": info.get("rs_order"),
+                # Per-variant audition buttons in the Gear card. Empty
+                # list when the amp has no `gain_variants` curation.
+                "variants": variants,
             })
         for lst in cats.values():
             # Primary sort: Rocksmith's psarc order (same order as the

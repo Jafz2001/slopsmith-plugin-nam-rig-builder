@@ -4948,6 +4948,28 @@ function rbRenderCatalogCard(g) {
                 title="Set clean / crunch / dist captures so the song's Gain knob picks the right one"
                 class="bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-300 border border-emerald-800/40 px-2.5 py-1 rounded text-xs">🎚 Variants</button>` : '';
 
+    // Audition row for amps with curated gain_variants — one mini ▶
+    // per variant (clean/crunch/dist/whatever the curator named them).
+    // Lets the user A/B the 3 captures without opening a song. The
+    // backend stamps `available: false` on variants whose NAM file is
+    // missing on disk; those render as a dimmed button.
+    let variantAuditionRow = '';
+    if (Array.isArray(g.variants) && g.variants.length) {
+        const btns = g.variants.map(v => {
+            const vId = `rb-aud-${_rbCatalogSeq++}`;
+            if (!v.available || !v.file) {
+                return `<button disabled title="NAM not downloaded — Setup → Download all curated variants"
+                                class="text-[10px] px-2 py-0.5 rounded bg-dark-800/50 text-gray-600 cursor-not-allowed">▶ ${rbEsc(v.level)}</button>`;
+            }
+            return `<button id="${vId}" onclick="rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}')"
+                            title="${rbEsc(v.notes || v.level)}"
+                            class="text-[10px] px-2 py-0.5 rounded bg-emerald-900/30 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/40">▶ ${rbEsc(v.level)}</button>`;
+        }).join(' ');
+        variantAuditionRow = `<div class="flex items-center gap-1 flex-wrap pl-[3.75rem]">
+            <span class="text-[10px] text-gray-500">variants:</span>${btns}
+        </div>`;
+    }
+
     return `
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-lg p-3 flex flex-col gap-2">
             <div class="flex items-center gap-3">
@@ -4967,6 +4989,7 @@ function rbRenderCatalogCard(g) {
                     ${variantsBtn}
                 </div>
             </div>
+            ${variantAuditionRow}
             <div id="rb-cat-lib-${safeId}" class="hidden bg-indigo-900/10 border border-indigo-800/30 rounded p-2"></div>
             <div id="rb-cat-variants-${safeId}" class="hidden bg-emerald-900/10 border border-emerald-800/30 rounded p-2"></div>
         </div>`;
