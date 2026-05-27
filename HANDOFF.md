@@ -10,6 +10,92 @@ database schema, API quirks, what's done, what isn't, and why.
 
 ---
 
+## Amp gain variants (`feat/amp-gain-variants` — experimental)
+
+Rocksmith amps respond to their Gain knob (a Twin at gain=10 is sparkling
+clean; at gain=80 it's snarling). Tone3000 captures are **fixed-setting
+snapshots** — one NAM is one (amp + knob position). So if we ship a single
+"Twin clean" capture for `Amp_Twin`, every Twin tone in every song uses that
+clean character even when the song asks for gain=80.
+
+The new `gain_variants` field in `rs_to_real.json` lets a curator ship up to
+N captures per amp, tagged by which RS-gain range each one models:
+
+```json
+"Amp_Twin": {
+  "name": "Fender Twin Reverb",
+  "category": "amp",
+  "tone3000_query": "fender twin reverb",
+  "gain_variants": {
+    "clean":  { "tone3000_id": 12345, "rs_gain_range": [0, 35] },
+    "crunch": { "tone3000_id": 12346, "rs_gain_range": [35, 70] },
+    "dist":   { "tone3000_id": 12347, "rs_gain_range": [70, 100] }
+  }
+}
+```
+
+`default_captures.json` accepts the same shape, so a curator can ship the
+variants without curating `rs_to_real.json` if they prefer.
+
+### Picking the variant
+
+`_pick_amp_gain_variant(gear_def, rs_gain)` (in `routes.py`):
+
+- **Pass 1**: returns the variant whose `rs_gain_range` covers the song's
+  Gain knob value.
+- **Pass 2 (fallback)**: closest range centre by distance to `rs_gain` —
+  lets a curator ship just 2 variants with a gap between them and still
+  get sensible picks for in-between gain values.
+- Returns `None` if `gain_variants` isn't defined → legacy single-NAM
+  behaviour. The feature is fully additive.
+
+The Gain knob is read via `_gear_rs_gain(piece)` from the parsed
+`piece["knobs"]["Gain"]` value. Defaults to 50.0 (centre) when absent.
+
+### Where it's wired in
+
+- `_auto_download_for_song` (per-song flow): cache key is
+  `(rs_type, variant_id)` so the same amp at two different gain settings
+  triggers two downloads. The `existing` DB lookup is `tone3000_id`-aware
+  so tone B's "dist" doesn't accidentally reuse tone A's "clean" file.
+- `_batch_worker` (library-wide flow): same cache key change.
+- `_existing_assignment_for_gear(rs_type, tone3000_id=...)`: the
+  library-wide reuse path also filters by `tone3000_id` when a variant
+  is in play.
+- `_enrich_chain_piece`: returns an `amp_variant` block when the gear has
+  variants, listing the picked level + the available levels. The per-song
+  UI renders that as an emerald badge under the amp piece.
+
+### Override
+
+There is no dedicated "switch variant" UI yet — the existing flow already
+handles it: the user picks a different NAM via **📚 Library** or the file
+input, the new file gets `assigned_mode='manual'`, and the batch leaves
+the manual choice alone forever after.
+
+### Curating new variants
+
+To add variants for an amp:
+
+1. Find 2-3 captures on tone3000 covering different gain settings of the
+   target amp. Note their `tone3000_id`.
+2. Edit `rs_to_real.json` (or ship via `default_captures.json` instead —
+   either works): add a `gain_variants` block as shown above.
+3. Pick `rs_gain_range` values. Common 3-tier split:
+   - `clean`: `[0, 35]`
+   - `crunch`: `[35, 70]`
+   - `dist`: `[70, 100]`
+4. Run Dashboard → Batch all → mode "all" so the existing songs pick the
+   right variant (legacy single-NAM downloads stay until they're
+   overwritten by the variant ones).
+
+Amps that benefit most (high non-linearity / wide gain range): Marshall
+JCM800, Mesa Boogie Mark series, Engl Powerball, Soldano SLO, Bogner
+Ecstasy, Friedman BE100. Cleaner amps (Twin, Princeton, Vox AC15) can
+get by with just `clean` + `crunch`.
+
+---
+
 ## v1.1.0 (2026-05-26) — OAuth login + smart batch + file picker
 
 Three changes since the 1.0.0 release. All plugin-only.
