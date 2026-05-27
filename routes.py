@@ -703,12 +703,14 @@ def _get_master_preset_id(role: str) -> int | None:
 
 def _cab_makeup_gain() -> float:
     """Read the user's cab-makeup-gain setting, clamped to [1.0, 2.83]
-    (0 to +9 dB). Multiplier applied to every IR/RS-IR stage's gain
+    (0 to +9 dB). The front-end applies this via
+    `slopsmithDesktop.audio.setGain('chain', X)` after every loadPreset
     so the user doesn't have to compensate per-preset for the natural
-    cab-sim attenuation. Default 1.41 ≈ +3 dB — conservative because
-    the same gain applies when the user bypasses the cab (passthrough
-    inherits the stage gain), so a high setting makes bypass painfully
-    loud."""
+    cab-sim attenuation. We tried writing it into the IR stage's
+    `state.gain` field first but the native engine ignores that — the
+    chain output gain is the only knob that actually moves.
+    Exposed through GET /settings so the front-end can fetch the
+    current value without re-reading the file each tone change."""
     try:
         g = float(_load_settings().get("cab_makeup_gain", 1.41))
     except (TypeError, ValueError):
@@ -779,7 +781,7 @@ def _build_master_stages(role: str, models_dir, irs_dir,
                 "bypassed": bypassed,
                 "slot": slot_tag,
                 "rs_gear": gear,
-                "state": _state_b64({"irPath": str(ir_path), "gain": float(output_gain) * _cab_makeup_gain()}),
+                "state": _state_b64({"irPath": str(ir_path), "gain": float(output_gain)}),
             })
         elif kind == "vst" and vst_path:
             vp = Path(vst_path)
@@ -3209,7 +3211,7 @@ def setup(app, context):
                     "bypassed": ir_bypassed,
                     "slot": ir_slot,
                     "rs_gear": ir_gear,
-                    "state": _state_b64({"irPath": str(ir_path), "gain": float(output_gain) * _cab_makeup_gain()}),
+                    "state": _state_b64({"irPath": str(ir_path), "gain": float(output_gain)}),
                 })
             else:
                 missing.append(ir_file)
@@ -3369,7 +3371,7 @@ def setup(app, context):
                         "slot": ir_slot,
                         "rs_gear": ir_gear,
                         "tone_key": tone_key,
-                        "state": _state_b64({"irPath": str(ir_path), "gain": float(out_gain) * _cab_makeup_gain()}),
+                        "state": _state_b64({"irPath": str(ir_path), "gain": float(out_gain)}),
                     })
                 else:
                     missing.append(ir_file)

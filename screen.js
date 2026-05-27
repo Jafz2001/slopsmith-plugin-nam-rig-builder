@@ -116,9 +116,21 @@
 //   Users on `standard` size can override via `window.__rbMutePreLoadHold`.
 //
 // Fade-in instead of instant restore so the chain-gain transition from 0
-// to 1.0 doesn't click. 4 steps over 24 ms (≈ 5 audio buffers at 256
+// to TARGET doesn't click. 4 steps over 24 ms (≈ 5 audio buffers at 256
 // samples / 48 kHz) sounds like a gentle swell, not a switch.
+//
+// TARGET = window.__rbCabMakeupGain (the user's Cab makeup gain setting,
+// cached by rbLoadSettings). The native engine ignores the per-stage
+// `gain` we write into the IR state JSON — chain output gain is the
+// only knob that actually moves levels — so the makeup happens here
+// during the fade-in. Falls back to 1.0 if the setting hasn't loaded
+// yet.
 let _rbMuteInFlight = false;
+function _rbChainGainTarget() {
+    const g = window.__rbCabMakeupGain;
+    if (typeof g !== 'number' || !isFinite(g)) return 1.0;
+    return Math.max(1.0, Math.min(2.83, g));
+}
 async function rbPreLoadMute(chainLen) {
     if (window.__rbMutePreLoad === false) return;
     if (_rbMuteInFlight) return;            // coalesce rapid tone changes
@@ -137,14 +149,16 @@ async function rbPreLoadMute(chainLen) {
         if (typeof audio.setMonitorMute === 'function') await audio.setMonitorMute(true);
     } catch (_) {}
     setTimeout(async () => {
+        const target = _rbChainGainTarget();
         try {
             // Un-mute the monitor immediately (it's a hard mute, no transient).
             if (!wasMuted && typeof audio.setMonitorMute === 'function') await audio.setMonitorMute(false);
-            // Fade chain gain 0 → 1.0 over ~24 ms in 4 steps so the
-            // restore doesn't click. The audio thread sees each step
-            // as a discrete value, but ear-perceived it's a smooth swell.
+            // Fade chain gain 0 → target over ~24 ms in 4 steps. Final
+            // value is the user's cab-makeup-gain so the boost lands
+            // during the same fade-in as the mute restore — no extra
+            // setGain call needed after the fade.
             if (typeof audio.setGain === 'function') {
-                const steps = [0.25, 0.5, 0.8, 1.0];
+                const steps = [target * 0.25, target * 0.5, target * 0.8, target];
                 for (const v of steps) {
                     await audio.setGain('chain', v);
                     await new Promise(r => setTimeout(r, 6));
@@ -153,6 +167,15 @@ async function rbPreLoadMute(chainLen) {
         } catch (_) {}
         _rbMuteInFlight = false;
     }, hold);
+}
+
+// Push the cab makeup gain to the engine RIGHT NOW (used when the user
+// drags the Settings slider mid-song — no point waiting until the next
+// loadPreset for the change to take effect).
+async function rbApplyCabMakeupGainNow() {
+    const audio = window.slopsmithDesktop && window.slopsmithDesktop.audio;
+    if (!audio || typeof audio.setGain !== 'function') return;
+    try { await audio.setGain('chain', _rbChainGainTarget()); } catch (_) {}
 }
 
 // NOTE: an earlier version of this file tried to monkey-patch
@@ -737,6 +760,9 @@ const RbMegaChain = (function () {
         if (s && typeof s.mega_chain_mode !== 'undefined') {
             window.__rbMegaChainSetting = !!s.mega_chain_mode;
             console.log(`[rig_builder mega-chain] boot setting=${window.__rbMegaChainSetting} (read from /settings)`);
+        }
+        if (s && typeof s.cab_makeup_gain === 'number') {
+            window.__rbCabMakeupGain = s.cab_makeup_gain;
         }
     }).catch(() => {});
 
@@ -4957,12 +4983,16 @@ async function rbLoadSettings() {
     if (megaCb) megaCb.checked = !!s.mega_chain_mode;
     const cabSlider = document.getElementById('rb-cab-makeup-gain');
     const cabLabel  = document.getElementById('rb-cab-makeup-gain-label');
+    const cabGain = (typeof s.cab_makeup_gain === 'number') ? s.cab_makeup_gain : 1.41;
+    // Cache to runtime so rbPreLoadMute's fade-in target lands at the
+    // user's chosen makeup. The engine ignores per-stage IR gain, so
+    // this chain-output gain is the only thing that actually moves levels.
+    window.__rbCabMakeupGain = cabGain;
     if (cabSlider) {
-        const g = (typeof s.cab_makeup_gain === 'number') ? s.cab_makeup_gain : 1.41;
-        cabSlider.value = g;
+        cabSlider.value = cabGain;
         if (cabLabel) {
-            const db = 20 * Math.log10(g);
-            cabLabel.textContent = `${db >= 0 ? '+' : ''}${db.toFixed(1)} dB (×${g.toFixed(2)})`;
+            const db = 20 * Math.log10(cabGain);
+            cabLabel.textContent = `${db >= 0 ? '+' : ''}${db.toFixed(1)} dB (×${cabGain.toFixed(2)})`;
         }
     }
     // Mirror the persisted flag onto the runtime mirror so RbMegaChain
@@ -5044,6 +5074,11 @@ async function rbSaveSettings() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ aggressive, min_downloads, preferred_size, mega_chain_mode, cab_makeup_gain }),
     });
+    // Refresh the runtime cache + push to the engine right now so the
+    // slider FEELS responsive (otherwise the change wouldn't audibly
+    // land until the next loadPreset).
+    window.__rbCabMakeupGain = cab_makeup_gain;
+    rbApplyCabMakeupGainNow().catch(() => {});
     // Mirror to the runtime so RbMegaChain picks it up without a restart.
     window.__rbMegaChainSetting = mega_chain_mode;
 }
