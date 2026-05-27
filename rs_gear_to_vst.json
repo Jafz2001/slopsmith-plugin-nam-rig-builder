@@ -125,16 +125,16 @@
   ],
 
   "Pedal_SpringReverb": [
-    {"name": "kHs Reverber",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Size, Damping, Predelay, Dry/Wet — small size + high damping = spring vibe"}
+    {"name": "kHs Reverb",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Size, Damping, Predelay, Dry/Wet — small size + high damping = spring vibe"}
   ],
   "Pedal_DigitalVerb": [
-    {"name": "kHs Reverber",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Larger room, less damping"}
+    {"name": "kHs Reverb",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Larger room, less damping"}
   ],
   "Pedal_PlateVerb": [
-    {"name": "kHs Reverber",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Medium size, low damping = plate"}
+    {"name": "kHs Reverb",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Medium size, low damping = plate"}
   ],
   "Pedal_TubeSpring": [
-    {"name": "kHs Reverber",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Small size + add kHs Distortion for the tube saturation"}
+    {"name": "kHs Reverb",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Small size + add kHs Distortion for the tube saturation"}
   ],
 
   "Pedal_Compression": [

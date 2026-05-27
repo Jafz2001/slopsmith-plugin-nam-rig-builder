@@ -164,14 +164,14 @@
   },
 
   "Pedal_SpringReverb": {
-    "khs reverber": {
+    "khs reverb": {
       "Time":  {"param": "Size",     "scale": 0.01, "_hint": "RS 'Time' on spring → KHS 'Size' (decay length is implicit in size)"},
       "Depth": {"param": "Damping",  "scale": 0.01, "invert": true, "_hint": "RS 'Depth' = more brightness → less damping. Invert."},
       "Mix":   {"param": "Dry/Wet",  "scale": 0.01}
     }
   },
   "Pedal_DigitalVerb": {
-    "khs reverber": {
+    "khs reverb": {
       "Time":  {"param": "Size",     "scale": 0.01},
       "Depth": {"param": "Predelay", "scale": 0.01, "_hint": "Larger depth = more predelay"},
       "Tone":  {"param": "Damping",  "scale": 0.01, "invert": true},
@@ -179,14 +179,14 @@
     }
   },
   "Pedal_PlateVerb": {
-    "khs reverber": {
+    "khs reverb": {
       "Time":  {"param": "Size",     "scale": 0.01},
       "Depth": {"param": "Predelay", "scale": 0.01},
       "Mix":   {"param": "Dry/Wet",  "scale": 0.01}
     }
   },
   "Pedal_TubeSpring": {
-    "khs reverber": {
+    "khs reverb": {
       "Time": {"param": "Size",    "scale": 0.01},
       "Mix":  {"param": "Dry/Wet", "scale": 0.01}
     }
