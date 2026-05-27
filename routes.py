@@ -123,16 +123,6 @@ _DEFAULT_SETTINGS = {
     # ourselves). Roll out only after the cooperative mute-parche flow is
     # confirmed stable on the user's hardware.
     "mega_chain_mode": False,
-    # Cab makeup gain — multiplier applied to the cab IR stage's gain so
-    # the user doesn't have to manually compensate for the natural
-    # attenuation of a cab simulation (typically -10 to -15 dB vs the
-    # raw amp output). Range clamped to [1.0, 2.83] when persisted = 0
-    # to +9 dB. Capped low because the makeup ALSO boosts the output
-    # when the user bypasses the cab (the gain lives on the stage, so
-    # passthrough sees the same boost) — too much makeup makes that
-    # bypass case painfully loud. Default 1.41 ≈ +3 dB is enough to
-    # take the edge off without making bypass dangerous.
-    "cab_makeup_gain": 1.41,
 }
 
 # Tone3000 platform value to request per Rocksmith category. Amps and
@@ -699,23 +689,6 @@ def _get_master_preset_id(role: str) -> int | None:
             "SELECT id FROM presets WHERE name = ?", (name,)
         ).fetchone()
         return int(new_row[0]) if new_row else None
-
-
-def _cab_makeup_gain() -> float:
-    """Read the user's cab-makeup-gain setting, clamped to [1.0, 2.83]
-    (0 to +9 dB). The front-end applies this via
-    `slopsmithDesktop.audio.setGain('chain', X)` after every loadPreset
-    so the user doesn't have to compensate per-preset for the natural
-    cab-sim attenuation. We tried writing it into the IR stage's
-    `state.gain` field first but the native engine ignores that — the
-    chain output gain is the only knob that actually moves.
-    Exposed through GET /settings so the front-end can fetch the
-    current value without re-reading the file each tone change."""
-    try:
-        g = float(_load_settings().get("cab_makeup_gain", 1.41))
-    except (TypeError, ValueError):
-        g = 1.41
-    return max(1.0, min(2.83, g))
 
 
 def _load_master_chain(role: str) -> list[dict]:
@@ -2542,7 +2515,6 @@ def setup(app, context):
             "aggressive": s.get("aggressive", False),
             "preferred_size": s.get("preferred_size", "standard"),
             "mega_chain_mode": s.get("mega_chain_mode", False),
-            "cab_makeup_gain": s.get("cab_makeup_gain", 1.41),
             "has_tone3000_key": bool(key),
             "tone3000_api_key_preview": (key[:6] + "…") if key else "",
             "tone3000_connected": bool(s.get("tone3000_access_token")),
@@ -2561,17 +2533,6 @@ def setup(app, context):
                 allowed["preferred_size"] = size
         if "mega_chain_mode" in data:
             allowed["mega_chain_mode"] = bool(data["mega_chain_mode"])
-        if "cab_makeup_gain" in data:
-            # Clamp to [1.0, 2.83] = 0 to +9 dB. Capped low because the
-            # makeup also amplifies when the cab is bypassed (gain lives
-            # on the stage state, so passthrough applies the same boost);
-            # +9 dB is the highest we want a bypass-spike to go without
-            # risking clipping or hearing damage on a sudden toggle.
-            try:
-                g = float(data["cab_makeup_gain"])
-                allowed["cab_makeup_gain"] = max(1.0, min(2.83, g))
-            except (TypeError, ValueError):
-                pass
         _save_settings(allowed)
         return {"ok": True}
 

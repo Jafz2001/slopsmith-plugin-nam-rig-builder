@@ -260,33 +260,6 @@
             </p>
         </div>
 
-        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
-            <h3 class="text-white font-semibold mb-3">Cab makeup gain</h3>
-            <p class="text-gray-500 text-sm mb-3">
-                Cab simulations (IRs) naturally attenuate the amp signal by 10-15 dB —
-                that's the cab absorbing energy + rolling off highs, same as a real cab.
-                This slider boosts the IR stage's output to compensate. <strong class="text-gray-300">+3 dB</strong>
-                is conservative; <strong class="text-gray-300">+6 dB</strong> brings it close to
-                the bypass level.
-            </p>
-            <p class="text-amber-300/90 text-xs mb-3 leading-snug">
-                ⚠️ The boost lives on the IR stage, so <strong>bypassing the cab also boosts the
-                signal by the same amount</strong> (the passthrough sees the gain too). That's why
-                the slider caps at +9 dB — a sudden bypass with the slider at max would jump 9 dB.
-                Keep it ≤ +6 dB if you toggle cab bypass often.
-            </p>
-            <label class="flex items-center gap-3 text-sm text-gray-300">
-                <input type="range" id="rb-cab-makeup-gain" min="1.0" max="2.83" step="0.1" value="1.41"
-                       oninput="document.getElementById('rb-cab-makeup-gain-label').textContent = '+' + (20*Math.log10(parseFloat(this.value))).toFixed(1) + ' dB (×' + parseFloat(this.value).toFixed(2) + ')';"
-                       onchange="rbSaveSettings()"
-                       class="flex-1">
-                <span id="rb-cab-makeup-gain-label" class="text-xs text-gray-400 w-32 text-right">+3.0 dB (×1.41)</span>
-            </label>
-            <p class="text-[11px] text-gray-500 mt-2 leading-snug">
-                Applies to every IR / Rocksmith-IR stage in your chains. Takes effect on the
-                next song-load / Listen-tap (chain JSON is rebuilt with the new gain).
-            </p>
-        </div>
 
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
             <h3 class="text-white font-semibold mb-3">Regenerate gear map</h3>
