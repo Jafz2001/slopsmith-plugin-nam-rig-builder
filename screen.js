@@ -760,17 +760,29 @@ const RbMegaChain = (function () {
         });
         // Last-chance fallback: if after 6 s the highway still hasn't
         // given us a tone (broken WS, unmapped song, exotic arrangement),
-        // pick tones[0] so the user isn't stuck in dead silence forever.
-        // This is the path that used to fire INSTANTLY and audibly play
-        // the wrong tone for the first second of every song — now it's
-        // only the safety net for the rare WS-never-publishes case.
+        // pick a guitar tone (or whatever's available) so the user isn't
+        // stuck in dead silence forever. Prefer GUITAR over BASS: the
+        // tones array's order comes from DB insertion (often alphabetical
+        // by tone_key) which sometimes lists bass tones first — e.g.
+        // Reptilia → tones[0] is "Reptilia_bass", which made the user
+        // hear a bass tone when they were playing guitar. The instrument
+        // hint we can extract is whether the tone_key looks bass-flavored.
+        // Matches the strings nam_tone names bass tones with: "_bass",
+        // "Bass_", or the gear referenced is in the Bass_* family.
         setTimeout(() => {
             if (!_active || !_mega) return;
             if (_activeToneKey) return;     // any recheck already landed
-            const fallback = mega.tones && mega.tones[0];
-            if (!fallback) return;
+            const all = (mega.tones || []);
+            if (!all.length) return;
+            const isBassFlavored = t =>
+                /(^|_)bass(_|\b)/i.test(t.tone_key || '')
+                || (Array.isArray(t.chain) && t.chain.some(p => /^Bass_/i.test(p.rs_gear || '')));
+            // Prefer a guitar tone, fall back to first available if all
+            // are bass-flavoured (rare — bass-only songs).
+            const fallback = all.find(t => !isBassFlavored(t)) || all[0];
             _applyActiveTone(fallback.tone_key).then(() => {
-                console.warn(`[rig_builder mega-chain] FALLBACK after 6s: applying tones[0] = "${fallback.tone_key}" — highway never published a tone base for this song`);
+                const flavour = isBassFlavored(fallback) ? 'BASS (no guitar tones in this song)' : 'guitar';
+                console.warn(`[rig_builder mega-chain] FALLBACK after 6s: applying "${fallback.tone_key}" [${flavour}] — highway never published a tone base for this song`);
             }).catch(() => {});
         }, 6000);
 
