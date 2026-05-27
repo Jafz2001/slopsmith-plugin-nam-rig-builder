@@ -168,6 +168,17 @@ _DEFAULT_SETTINGS = {
     # at -9 dB so the loudest captures don't drop below audibility.
     "nam_normalize_max_boost_db": 20.0,
     "nam_normalize_max_cut_db": 9.0,
+    # NAM input drive. The amp model is a function: same input → same
+    # output. Captures are typically taken with a calibrated ~-3 dBFS
+    # signal driving the amp into its saturation range; live guitar
+    # arrives at the engine around -18 to -12 dBFS peak. Without a
+    # boost the NAM operates in its CLEAN region for every note — so
+    # even high-gain amps come out sounding clean. We feed each NAM
+    # stage an inputLevel of ~2.5 (≈+8 dB) so the amp's nonlinearity
+    # actually kicks in. The accompanying outputLevel adjustment
+    # (`_nam_normalized_output_level`) divides this back out so the
+    # perceived volume stays at the loudness target.
+    "nam_input_drive": 2.5,
     # When toggled, bypasses (or un-bypasses) the cabinet slot on EVERY song's
     # tones in one shot — for users who'd rather run no cab (raw amp) or their
     # own external cab sim. Stored just for the checkbox state; the actual
@@ -590,7 +601,14 @@ def _nam_normalized_output_level(path: Path) -> float:
     max_cut = float(settings.get("nam_normalize_max_cut_db", 9.0))
     makeup_db = target - loudness
     makeup_db = max(-max_cut, min(max_boost, makeup_db))
-    return 10.0 ** (makeup_db / 20.0)
+    raw = 10.0 ** (makeup_db / 20.0)
+    # The inputLevel boost we apply to feed the NAM at capture-level
+    # multiplies the OUTPUT too (the amp's gain is post-input). Divide
+    # the makeup by the input drive so the perceived loudness lands at
+    # the target instead of target + input_drive_dB. Capped so the
+    # output never goes super-quiet for a sky-high input drive setting.
+    input_drive = max(0.1, float(settings.get("nam_input_drive", 2.5)))
+    return raw / input_drive
 
 
 def _gear_rs_gain(piece: dict, gear_def: dict | None = None) -> float:
@@ -4362,13 +4380,17 @@ def setup(app, context):
                     "bypassed": bypassed,
                     "slot": slot,
                     "rs_gear": gear,
-                    # Unity input for every NAM so intermediate stages feed
-                    # the next at full level. outputLevel is per-NAM loudness-
-                    # normalised — eliminates the volume jumps across songs
-                    # that use captures authored at different LUFS targets.
+                    # Amp NAMs need inputLevel above unity to reach the
+                    # saturation region of the captured model (live guitar
+                    # arrives quieter than the capture-time DI). Pedal/
+                    # rack NAMs stay at unity so we don't over-drive a
+                    # clean modulation/utility plugin. outputLevel
+                    # divides the drive back out so the perceived volume
+                    # tracks the LUFS target regardless of input boost.
                     "state": _state_b64({
                         "modelPath": str(path),
-                        "inputLevel": 1.0,
+                        "inputLevel": (_load_settings().get("nam_input_drive", 2.5)
+                                       if slot == "amp" else 1.0),
                         "outputLevel": _nam_normalized_output_level(path),
                     }),
                 })
@@ -4539,9 +4561,13 @@ def setup(app, context):
                         "slot": slot,
                         "rs_gear": gear,
                         "tone_key": tone_key,
+                        # Drive only the amp slot — see native_preset_full
+                        # for the rationale (avoid over-driving clean
+                        # utility pedal NAMs).
                         "state": _state_b64({
                             "modelPath": str(path),
-                            "inputLevel": 1.0,
+                            "inputLevel": (_load_settings().get("nam_input_drive", 2.5)
+                                           if slot == "amp" else 1.0),
                             "outputLevel": _nam_normalized_output_level(path),
                         }),
                     })
@@ -4764,6 +4790,14 @@ def setup(app, context):
             p = _safe_child(models_dir, file)
             if not p or not p.exists():
                 return JSONResponse({"error": "model not found"}, 404)
+            # Apply the amp-only input drive when auditioning a file
+            # under nam_models/amps/. We can't see the slot in this
+            # endpoint (it's a single file, no preset context), so we
+            # use the storage subdir as the proxy — same intent as the
+            # full-chain code: drive amps, leave pedals/racks unity.
+            _is_amp = (file or "").lower().startswith("amps/")
+            _drive = (_load_settings().get("nam_input_drive", 2.5)
+                       if _is_amp else 1.0)
             stage = {"type": 1, "name": Path(file).stem, "path": str(p),
                      "bypassed": False,
                      # Single-NAM audition (▶ button) — apply the same
@@ -4772,7 +4806,8 @@ def setup(app, context):
                      # The caller-provided `gain` (defaults to 1.0)
                      # multiplies the normalised level so user overrides
                      # still work.
-                     "state": _state_b64({"modelPath": str(p), "inputLevel": 1.0,
+                     "state": _state_b64({"modelPath": str(p),
+                                          "inputLevel": _drive,
                                           "outputLevel": float(gain) * _nam_normalized_output_level(p)})}
         return {"native_preset": {"version": 1, "chain": [stage]}}
 
