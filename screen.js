@@ -4062,6 +4062,18 @@ async function rbDoVstScan(statusSetter) {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({plugins: rbState.knownVsts}),
         }).catch(() => {});
+        // The backend merges scan results with previously-seeded entries
+        // (seed_known_vsts.py + any prior successful scans), so the merged
+        // total can be > what scan returned this run. Re-fetch /vst/known
+        // to pick up the merged list instead of showing only what scan
+        // got before crashing.
+        try {
+            const merged = await (await fetch(`${RB_API}/vst/known`)).json();
+            if (Array.isArray(merged.plugins) &&
+                merged.plugins.length >= rbState.knownVsts.length) {
+                rbState.knownVsts = merged.plugins;
+            }
+        } catch (_) { /* fall back to local scan result */ }
         statusSetter && statusSetter(`found ${rbState.knownVsts.length} plugins`);
         return rbState.knownVsts;
     } finally {
@@ -4978,9 +4990,17 @@ function rbRenderCatalogCard(g) {
         parent = `<span class="text-gray-500">(unassigned)</span>`;
     }
     let listenBtn = '';
+    let editBtn = '';
     if (isVst) {
         listenBtn = `<button id="${btnId}" onclick="rbAuditionVst('${rbEsc(g.vst_path).replace(/'/g,"\\'")}','${rbEsc(g.vst_format || 'VST3')}','${btnId}')"
                             title="Listen to this VST in isolation" class="bg-purple-700/50 hover:bg-purple-600/60 text-purple-100 px-2.5 py-1 rounded text-xs flex-shrink-0">▶</button>`;
+        // Direct "edit this VST" — loads the plugin and opens the native
+        // editor window. Saves a click vs the 📚 Library re-pick flow when
+        // the gear already has a VST assigned (the common case after the
+        // bulk-assign step).
+        editBtn = `<button onclick="rbCatalogEditVst('${rbEsc(g.vst_path).replace(/'/g,"\\'")}','${rbEsc(g.vst_format || 'VST3')}')"
+                           title="Edit this VST's settings (loads + opens native editor)"
+                           class="bg-purple-900/40 hover:bg-purple-900/60 text-purple-200 border border-purple-800/50 px-2.5 py-1 rounded text-xs flex-shrink-0">🎛 Edit</button>`;
     } else if (g.assigned) {
         listenBtn = `<button id="${btnId}" onclick="rbAuditionFile('${rbEsc(g.file).replace(/'/g,"\\'")}', '${rbEsc(g.kind || 'nam')}', '${btnId}')"
                             title="Listen to this gear in isolation" class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-2.5 py-1 rounded text-xs flex-shrink-0">▶</button>`;
@@ -5035,7 +5055,7 @@ function rbRenderCatalogCard(g) {
                     <div class="text-xs mt-0.5 truncate">${parent}</div>
                 </div>
                 <div class="flex items-center gap-2 flex-shrink-0">
-                    ${t3kLink}${listenBtn}
+                    ${t3kLink}${listenBtn}${editBtn}
                     <button onclick="rbOpenSuggest('${rbEsc(g.rs_gear)}')"
                             class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-2.5 py-1 rounded text-xs">Search</button>
                     <button onclick="rbToggleCatalogLibrary('${rbEsc(g.rs_gear)}','${rbEsc(g.category || '')}','${rbEsc(g.vst_path || '')}','${rbEsc(g.vst_format || 'VST3')}')"
@@ -5666,6 +5686,44 @@ async function rbLoadCatalogVstSuggestions(rsGearType, panelId) {
 
 // Audition a VST in isolation (catalog row ▶). Mirrors rbAuditionFile but for
 // stage type 0 (VST) instead of 1 (NAM) / 2 (IR).
+// Direct "edit this VST" from the Gear catalog — loads the plugin into a
+// throwaway slot and pops the native editor window. Saves the "📚 Library
+// → re-pick the same VST → open editor" detour once a gear already has a
+// VST assigned. Stops any other preview/audition first and closes any
+// open VST editor window (orphaned windows are the known crash trigger).
+async function rbCatalogEditVst(vstPath, vstFormat) {
+    const api = rbNativeAudio();
+    if (!api || typeof api.loadVST !== 'function') {
+        alert('Native VST hosting not available.');
+        return;
+    }
+    try {
+        await rbCloseActiveVstEditor();
+        if (rbState.listeningTone !== null || rbState._auditionId) {
+            await rbStopPreview();
+        }
+        if (api.clearChain) await api.clearChain().catch(() => {});
+        const wasRunning = api.isAudioRunning ? await api.isAudioRunning().catch(() => true) : true;
+        if (!wasRunning) await api.startAudio().catch(() => {});
+        const slotId = await api.loadVST(vstPath);
+        if (slotId == null || slotId < 0) {
+            alert(`Engine refused to load this plugin:\n${vstPath}`);
+            return;
+        }
+        rbState._vstEditorSlot = slotId;
+        if (api.openPluginEditor) {
+            await api.openPluginEditor(slotId).catch((e) => {
+                console.warn('[rig_builder] openPluginEditor failed:', e);
+                alert(`Couldn't open editor for this plugin (the native window may have crashed). Plugin is loaded — try again or use the inline editor in a song's slot.`);
+            });
+        } else {
+            alert('This Slopsmith build has no openPluginEditor API.');
+        }
+    } catch (e) {
+        alert(`Edit failed: ${e.message || e}`);
+    }
+}
+
 async function rbAuditionVst(vstPath, vstFormat, btnId) {
     const api = rbNativeAudio();
     if (!api) return;
@@ -5681,6 +5739,10 @@ async function rbAuditionVst(vstPath, vstFormat, btnId) {
     }
     try {
         if (btn) { btn.disabled = true; btn.textContent = '…'; }
+        // Close any open VST editor window BEFORE clearing the chain — an
+        // orphaned editor window pointing at a slot we're about to wipe is
+        // the known crash trigger on consecutive ▶ Audition clicks.
+        await rbCloseActiveVstEditor();
         const url = `${RB_API}/native_preset_one?kind=vst&vst_path=${encodeURIComponent(vstPath)}&vst_format=${encodeURIComponent(vstFormat || 'VST3')}`;
         const payload = await (await fetch(url)).json();
         if (!payload || !payload.native_preset) throw new Error('no preset returned');
