@@ -5340,22 +5340,22 @@ function rbRenderCatalogCard(g) {
     const expanded = rbState.gearExpanded && rbState.gearExpanded.has(g.rs_gear);
     const isVst = g.kind === 'vst' && g.vst_path;
 
-    // Status text under the rs_gear. Three states:
-    //   ✓ VST   — purple
-    //   ✓ <NAM/IR name> — green
-    //   (unassigned)    — gray
-    let statusLine;
+    // Assignment label — only rendered inside the expanded action panel
+    // now (the collapsed row used to show it under the rs_gear codename,
+    // but that line repeated 100+ times made the catalog feel noisy).
+    let assignedLine;
     if (isVst) {
         const vstName = g.vst_path.split('/').pop();
-        statusLine = `<div class="text-xs text-purple-300/90 truncate" title="${rbEsc(g.vst_path)}">✓ VST: ${rbEsc(vstName)}</div>`;
+        assignedLine = `<div class="text-xs text-purple-300/90 break-all" title="${rbEsc(g.vst_path)}">✓ VST: ${rbEsc(vstName)}</div>`;
     } else if (g.assigned) {
         const label = g.tone3000_title || rbLibShortName(g.file) || 'assigned';
-        statusLine = `<div class="text-xs text-green-400/90 truncate" title="${rbEsc(g.file || '')}">✓ ${rbEsc(label)}</div>`;
+        assignedLine = `<div class="text-xs text-green-400/90 break-all" title="${rbEsc(g.file || '')}">✓ ${rbEsc(label)}</div>`;
     } else {
-        statusLine = `<div class="text-xs text-gray-500">(unassigned)</div>`;
+        assignedLine = `<div class="text-xs text-gray-500">(unassigned)</div>`;
     }
 
-    // Status dot: green = NAM/IR, purple = VST, gray = unassigned.
+    // Status dot — moved to the far-right of the card so it reads as a
+    // status indicator rather than a bullet attached to the name.
     let dotColor, dotTitle;
     if (isVst) { dotColor = 'bg-purple-400'; dotTitle = 'VST plugin loaded'; }
     else if (g.assigned) { dotColor = 'bg-green-400'; dotTitle = 'NAM/IR assigned'; }
@@ -5432,6 +5432,7 @@ function rbRenderCatalogCard(g) {
     // each other — they stay hidden by class.
     const actionsPanel = expanded ? `
         <div class="border-t border-gray-800/50 mt-2 pt-2 space-y-2">
+            ${assignedLine}
             <div class="flex flex-wrap items-center gap-1.5">
                 ${listenBtn}
                 ${variantsBtn}
@@ -5455,15 +5456,12 @@ function rbRenderCatalogCard(g) {
             <div class="flex items-start gap-3">
                 ${photoBlock}
                 <div class="min-w-0 flex-1">
-                    <div class="flex items-start gap-2">
-                        <span class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${dotColor}" title="${rbEsc(dotTitle)}"></span>
-                        <div class="min-w-0 flex-1">
-                            <div class="text-gray-100 font-medium leading-tight break-words" title="${rbEsc(g.real_name)}">${rbEsc(g.real_name)}</div>
-                            <div class="text-[11px] text-gray-500 font-mono break-all">${rbEsc(g.rs_gear)}</div>
-                            ${statusLine}
-                        </div>
-                        <span class="text-gray-500 text-xs flex-shrink-0 select-none mt-0.5" aria-hidden="true">${chevron}</span>
-                    </div>
+                    <div class="text-gray-100 font-medium leading-tight break-words" title="${rbEsc(g.real_name)}">${rbEsc(g.real_name)}</div>
+                    <div class="text-[11px] text-gray-500 font-mono break-all">${rbEsc(g.rs_gear)}</div>
+                </div>
+                <div class="flex flex-col items-end gap-2 flex-shrink-0">
+                    <span class="text-gray-500 text-xs select-none" aria-hidden="true">${chevron}</span>
+                    <span class="w-2.5 h-2.5 rounded-full ${dotColor}" title="${rbEsc(dotTitle)}"></span>
                 </div>
             </div>
             ${actionsPanel}
