@@ -1506,12 +1506,35 @@ def _enrich_chain_piece(piece: dict, img_idx: dict | None = None) -> dict:
     # extract_irs.py) doesn't surface broken references — the UI just
     # falls back to the tone3000 deep-link for that cab.
     rs_irs: list[str] = []
+    cab_mic_variants: list[dict] = []
     if category == "cab":
         rs_entry = _load_rs_cab_to_ir().get(rs_type) or {}
         candidates = list(rs_entry.get("irs") or [])
         irs_root = _config_dir / "nam_irs" if _config_dir else None
         if irs_root:
             rs_irs = [f for f in candidates if (irs_root / f).exists()]
+        # Per-mic-position list — same shape as the catalog enrichment so
+        # the song editor can render labeled audition buttons ("Dynamic
+        # Cone", "Condenser Edge", "Tube Off-axis", …) instead of a raw
+        # filename dropdown. Sorted by ir_index for stable layout.
+        mic_map = _load_rs_cab_mic_map().get(rs_type) or {}
+        if mic_map and irs_root is not None:
+            for suffix, entry in sorted(
+                    mic_map.items(),
+                    key=lambda kv: kv[1].get("ir_index", 99)):
+                f = entry.get("ir_file")
+                available = (
+                    bool(f) and (irs_root / f).exists()
+                )
+                cab_mic_variants.append({
+                    "suffix": suffix,
+                    "ir_index": entry.get("ir_index"),
+                    "ir_file": f,
+                    "label": entry.get("label") or suffix,
+                    "mic_type": entry.get("mic_type"),
+                    "position": entry.get("position"),
+                    "available": available,
+                })
 
     # Amp gain variant info — only relevant when the curator has
     # actually shipped `gain_variants` for this amp in rs_to_real.json.
@@ -1582,6 +1605,11 @@ def _enrich_chain_piece(piece: dict, img_idx: dict | None = None) -> dict:
         "tone3000_platform": platform,
         "tone3000_search_url": deep_link,
         "rs_irs": rs_irs,
+        # Labeled mic-position picker for cab pieces (Dynamic Cone,
+        # Condenser Edge, …). Empty when the cab has no entry in
+        # rs_cab_mic_map.json (e.g. the user hasn't re-run extract_irs
+        # since we started emitting the map).
+        "cab_mic_variants": cab_mic_variants,
         "amp_variant": amp_variant_info,
         "assigned": assigned,
     }
@@ -6000,20 +6028,60 @@ def setup(app, context):
     #   POST /gear/replace_with          swap one gear's file across all songs
 
     def _resolve_gear_file(rs_gear: str, level: str | None,
-                            rs_gain: float | None) -> tuple[str | None, int | None]:
+                            rs_gain: float | None) -> tuple[str | None, int | None, str | None]:
         """Resolve a gear's NAM/IR file path given an optional variant
         level OR an rs_gain to auto-pick from gain_variants.
 
-        Returns (relative_file, tone3000_id) — file in the "<subdir>/<name>"
-        form that the engine resolves via _safe_child, or (None, None) if
-        the gear has no variants and no fallback file. Used by both the
-        per-song variant override (level given) and the gear-replace
-        bulk-update (uses rs_gain to pick the matching variant).
+        Returns (relative_file, tone3000_id, kind) where:
+          - kind = 'nam' for amp/pedal/rack files (or for cabs that ship
+            a tone3000 cab capture as a NAM — uncommon)
+          - kind = 'rs_ir' for cabs resolved from rs_cab_mic_map / rs_cab_to_ir
+          - file in the engine-relative form (`<subdir>/<name>` for NAMs,
+            `rocksmith/<name>` for RS IRs)
+          - (None, None, None) when nothing's on disk
+
+        Cab branch picks the IR by `level` (a mic-position suffix like
+        `5c` / `cc`) when supplied, else the first available IR from the
+        mic map, else the first available IR from rs_cab_to_ir.
         """
         if _config_dir is None:
-            return None, None
+            return None, None, None
         rs_map = _load_rs_to_real() or {}
         info = rs_map.get(rs_gear) or {}
+        category = (info.get("category") or "").lower()
+
+        # ── Cab branch: IRs, not NAMs ──────────────────────────────
+        if category == "cab" or rs_gear.lower().startswith(("cab_", "bass_cab_")):
+            irs_root = _config_dir / "nam_irs"
+            mic_map = _load_rs_cab_mic_map().get(rs_gear) or {}
+            chosen_file: str | None = None
+            # 1. If the caller asked for a specific mic-position level, use it.
+            if level and level != "auto" and level in mic_map:
+                cand = (mic_map[level] or {}).get("ir_file")
+                if cand and (irs_root / cand).exists():
+                    chosen_file = cand
+            # 2. Default mic: prefer "Dynamic Cone" (5c), then any close-mic
+            #    variant, then the first available — keeps the swap experience
+            #    consistent ("similar mic, different cab").
+            if chosen_file is None:
+                preferred_order = ["5c", "cc", "tc", "rc", "5e", "ce", "te"]
+                for k in preferred_order + sorted(mic_map):
+                    cand = (mic_map.get(k) or {}).get("ir_file")
+                    if cand and (irs_root / cand).exists():
+                        chosen_file = cand
+                        break
+            # 3. Fallback to the legacy rs_cab_to_ir list (no labels).
+            if chosen_file is None:
+                rs_entry = _load_rs_cab_to_ir().get(rs_gear) or {}
+                for cand in rs_entry.get("irs") or []:
+                    if (irs_root / cand).exists():
+                        chosen_file = cand
+                        break
+            if chosen_file:
+                return chosen_file, None, "rs_ir"
+            return None, None, None
+
+        # ── Amp / pedal / rack branch: NAMs via gain_variants ───────
         variants = info.get("gain_variants") or {}
         # Decide which variant we're after.
         spec = None
@@ -6023,7 +6091,7 @@ def setup(app, context):
             # Auto-pick by rs_gain (or 50.0 fallback in the helper).
             spec = _pick_amp_gain_variant(info, rs_gain if rs_gain is not None else 50.0)
         if not spec or not isinstance(spec, dict):
-            return None, None
+            return None, None, None
         # Find the file on disk — same dual-naming lookup the wire-up
         # sweep uses (readable-from-notes first, legacy second).
         subdir = _category_subdir_for_gear(rs_gear)
@@ -6034,13 +6102,13 @@ def setup(app, context):
         if title:
             cand = amp_dir / f"{_safe_filename_human(title)}.nam"
             if cand.exists():
-                return f"{subdir}/{cand.name}", tone3000_id
+                return f"{subdir}/{cand.name}", tone3000_id, "nam"
         if model_id and tone3000_id:
             legacy = (f"tone3000_{tone3000_id}_m{model_id}_"
                       f"{_safe_filename(rs_gear)}.nam")
             if (amp_dir / legacy).exists():
-                return f"{subdir}/{legacy}", tone3000_id
-        return None, tone3000_id
+                return f"{subdir}/{legacy}", tone3000_id, "nam"
+        return None, tone3000_id, None
 
     @app.get("/api/plugins/rig_builder/gears_in_category/{category}")
     def gears_in_category(category: str):
@@ -6057,12 +6125,29 @@ def setup(app, context):
         rs_map = _load_rs_to_real() or {}
         img_idx = _tone_image_index() if category == "amp" else {}
         out = []
+        is_cab = category.lower() == "cab"
+        # Cabs in rs_to_real.json are stored per mic-position (e.g.
+        # `Bass_Cab_AT1150BC_5c`, `_5e`, `_co`, … — 147 entries). The
+        # picker should show ONE entry per base cab, so collapse the
+        # suffix and dedupe; pick the entry with the most curated info
+        # as the representative. Mic-position picking happens elsewhere
+        # (rs_cab_mic_map / per-song picker).
+        mic_suffix_re = re.compile(r"_(?:[0-9]?[a-z]{1,2})$")
+        seen_bases: set[str] = set()
         for k, info in rs_map.items():
             if not isinstance(info, dict):
                 continue
             cat = (info.get("category") or "").lower()
             if cat != category.lower():
                 continue
+            if is_cab:
+                base = mic_suffix_re.sub("", k)
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                display_key = base
+            else:
+                display_key = k
             variants = info.get("gain_variants") or {}
             # Photo: pick the first variant's tone3000_id and look up the
             # cached image. For non-variant gears (most cabs/pedals)
@@ -6073,13 +6158,23 @@ def setup(app, context):
                     t3kid = spec["tone3000_id"]
                     break
             meta = img_idx.get(t3kid) if t3kid else None
+            # Cab variant count comes from rs_cab_mic_map (mic positions),
+            # not from gain_variants.
+            if is_cab:
+                mic_count = len(_load_rs_cab_mic_map().get(display_key) or {})
+                variant_count = mic_count
+                variant_levels = list(
+                    (_load_rs_cab_mic_map().get(display_key) or {}).keys())
+            else:
+                variant_count = len(variants)
+                variant_levels = list(variants.keys())
             out.append({
-                "rs_gear": k,
-                "name": info.get("name") or k,
+                "rs_gear": display_key,
+                "name": info.get("name") or display_key,
                 "make": info.get("make", ""),
                 "model": info.get("model", ""),
-                "variant_count": len(variants),
-                "variant_levels": list(variants.keys()),
+                "variant_count": variant_count,
+                "variant_levels": variant_levels,
                 "rs_order": info.get("rs_order"),
                 "image": (meta or {}).get("image"),
             })
@@ -6160,22 +6255,22 @@ def setup(app, context):
             rs_gain = float(rs_gain) if rs_gain is not None else None
         except (ValueError, TypeError):
             rs_gain = None
-        file, tone3000_id = _resolve_gear_file(
+        file, tone3000_id, kind = _resolve_gear_file(
             rs_gear, None if level == "auto" else level, rs_gain)
         if not file:
-            return JSONResponse({"error": f"variant '{level}' has no NAM on disk for {rs_gear}"}, 404)
+            return JSONResponse({"error": f"variant '{level}' has no file on disk for {rs_gear}"}, 404)
         mode = "auto" if level == "auto" else "manual"
         with _lock:
             conn.execute(
                 "UPDATE preset_pieces "
-                "SET file = ?, kind = 'nam', tone3000_id = ?, assigned_mode = ? "
+                "SET file = ?, kind = ?, tone3000_id = ?, assigned_mode = ? "
                 "WHERE preset_id = ? AND rs_gear_type = ?",
-                (file, tone3000_id, mode, preset_id, rs_gear),
+                (file, kind or "nam", tone3000_id, mode, preset_id, rs_gear),
             )
             _recompute_preset_primaries(conn, preset_id)
             conn.commit()
         return {"ok": True, "file": file, "tone3000_id": tone3000_id,
-                "variant": level, "assigned_mode": mode}
+                "kind": kind, "variant": level, "assigned_mode": mode}
 
     @app.post("/api/plugins/rig_builder/gear/replace_with")
     def gear_replace_with(data: dict = Body(...)):
@@ -6211,9 +6306,18 @@ def setup(app, context):
         if from_gear == to_gear:
             return {"ok": True, "noop": True}
         rs_map = _load_rs_to_real() or {}
-        to_info = rs_map.get(to_gear)
-        if not to_info or not to_info.get("gain_variants"):
-            return JSONResponse({"error": f"{to_gear} has no gain_variants curated"}, 400)
+        to_info = rs_map.get(to_gear) or {}
+        to_category = (to_info.get("category") or "").lower()
+        # Cabs use rs_cab_mic_map (any mic position with an IR on disk
+        # is enough); only amps/pedals/racks require curated gain_variants.
+        if to_category == "cab":
+            if not (_load_rs_cab_mic_map().get(to_gear) or
+                    (_load_rs_cab_to_ir().get(to_gear) or {}).get("irs")):
+                return JSONResponse(
+                    {"error": f"{to_gear} has no extracted IRs on disk"}, 400)
+        elif not to_info.get("gain_variants"):
+            return JSONResponse(
+                {"error": f"{to_gear} has no gain_variants curated"}, 400)
         conn = _get_conn()
         # Walk every row of the source gear, resolve the replacement's
         # variant for each row's Gain, then update.
@@ -6243,16 +6347,16 @@ def setup(app, context):
                     rs_gain = float(rs_gain) if rs_gain is not None else None
                 except (ValueError, TypeError):
                     rs_gain = None
-                file, tone3000_id = _resolve_gear_file(to_gear, None, rs_gain)
+                file, tone3000_id, kind = _resolve_gear_file(to_gear, None, rs_gain)
                 if not file:
                     skipped += 1
                     continue
                 conn.execute(
                     "UPDATE preset_pieces "
-                    "SET file = ?, kind = 'nam', tone3000_id = ?, "
+                    "SET file = ?, kind = ?, tone3000_id = ?, "
                     "    assigned_mode = 'manual' "
                     "WHERE id = ?",
-                    (file, tone3000_id, pid_row),
+                    (file, kind or "nam", tone3000_id, pid_row),
                 )
                 updated += 1
                 affected_presets.add(preset_id)

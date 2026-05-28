@@ -2096,10 +2096,39 @@ function rbRenderPieceEditor(p, toneIdx, pIdx, filename) {
         stageClass = 'text-gray-500';
     }
 
-    // Rocksmith IR dropdown — cab-only.
-    const rsIrs = p.rs_irs || [];
+    // Cab mic-position picker — clickable buttons per mic resolved
+    // from rs_cab_mic_map (Dynamic Cone, Condenser Edge, Tube Off-axis,
+    // …). Falls back to the legacy "Rocksmith IR (N):" filename dropdown
+    // for cabs whose mic_variants the extractor couldn't resolve
+    // (e.g. the user hasn't re-run extract_irs since we added the map).
     let rsIrControl = '';
-    if (rsIrs.length > 0) {
+    const micVariants = p.cab_mic_variants || [];
+    if (micVariants.length > 0) {
+        const activeFile = effFile;
+        const btns = micVariants.map(v => {
+            const active = v.ir_file === activeFile;
+            if (!v.available || !v.ir_file) {
+                return `<button disabled title="IR not extracted"
+                                class="px-2.5 py-0.5 rounded border text-[11px] bg-dark-800/40 text-gray-600 border-gray-800 cursor-not-allowed">${rbEsc(v.label || v.suffix)}</button>`;
+            }
+            const cls = active
+                ? 'bg-sky-700/60 text-sky-100 border-sky-500/60 font-semibold'
+                : 'bg-dark-800 text-gray-300 border-gray-700 hover:bg-sky-900/40 hover:text-sky-200 hover:border-sky-700/40';
+            return `<button onclick="rbPickCabMic(${toneIdx}, ${pIdx}, '${rbEsc(v.ir_file).replace(/'/g,"\\'")}')"
+                            title="${rbEsc(v.mic_type || '')} · ${rbEsc(v.position || '')} (suffix ${rbEsc(v.suffix)})"
+                            class="px-2.5 py-0.5 rounded border text-[11px] transition ${cls}">${rbEsc(v.label || v.suffix)}</button>`;
+        }).join(' ');
+        rsIrControl = `
+            <div class="bg-sky-900/15 border border-sky-800/30 rounded p-2.5 mt-2">
+                <div class="flex items-center gap-2 mb-1.5">
+                    <span class="text-xs text-sky-400">🎙 Mic position</span>
+                    <span class="text-[10px] text-gray-500">Rocksmith-extracted IRs — click to switch</span>
+                </div>
+                <div class="flex items-center gap-1.5 flex-wrap">${btns}</div>
+            </div>`;
+    } else if ((p.rs_irs || []).length > 0) {
+        // Legacy fallback: raw dropdown for cabs without a mic map.
+        const rsIrs = p.rs_irs;
         const options = rsIrs.map(f => `<option value="${rbEsc(f)}">${rbEsc(f.split('/').pop())}</option>`).join('');
         rsIrControl = `
             <div class="flex items-center gap-2 bg-green-900/15 border border-green-800/30 rounded px-2 py-1.5 mt-2">
@@ -2206,12 +2235,11 @@ function rbRenderPieceEditor(p, toneIdx, pIdx, filename) {
             ${ampVariantBadge}
 
             <div class="flex flex-wrap items-center gap-2">
-                ${!isCab ? `
                 <button onclick="rbToggleGearSwap(${toneIdx}, ${pIdx})"
                         title="Swap this ${rbEsc(p.rs_category)} for a different one — just for this song"
                         class="bg-amber-900/25 hover:bg-amber-900/45 text-amber-300 border border-amber-800/40 px-3 py-1.5 rounded text-xs">
                     🔁 Swap…
-                </button>` : ''}
+                </button>
                 ${hasVst ? `
                 <button onclick="rbToneEditVst(${toneIdx}, ${pIdx})"
                         title="Load this VST in the engine and edit its parameters with inline sliders"
@@ -4782,6 +4810,20 @@ function rbAssignRsIr(btn, toneIdx, pIdx) {
     label.textContent = `✓ ${file}`;
     label.classList.add('text-green-400');
     rbAfterGearChange(toneIdx);   // reflect + re-audition immediately
+}
+
+// Click handler for the cab mic-position buttons. The mic_variants
+// payload (per piece) already came with the resolved ir_file for each
+// suffix — we just pin that file as the assigned IR, mark the piece
+// kind as rs_ir, and let the chain-edit flow persist + reload.
+function rbPickCabMic(toneIdx, pIdx, irFile) {
+    const piece = rbState.songTones && rbState.songTones.tones
+        && rbState.songTones.tones[toneIdx]
+        && rbState.songTones.tones[toneIdx].chain[pIdx];
+    if (!piece || !irFile) return;
+    piece._uploaded_file = irFile;
+    piece._uploaded_kind = 'rs_ir';
+    rbAfterGearChange(toneIdx);
 }
 
 async function rbUploadFile(input, toneIdx, pIdx) {
