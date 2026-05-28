@@ -4876,6 +4876,11 @@ function rbToggleBypass(toneIdx, pIdx, btn) {
     const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
     piece._bypassed = !piece._bypassed;
     rbUpdateBypassBtn(btn, piece._bypassed);
+    // Re-render the editor so the chain-strip card's photo (grayscale
+    // when bypassed) and its status dot update immediately — without
+    // this, the visual state only refreshed when the user clicked a
+    // different piece. Cheap enough to do on every toggle.
+    rbReRenderSongEditor();
     // Persist the bypass for this song right away so it survives reload /
     // restart (it used to live only in memory until "Save preset").
     if (rbState.currentSongFile) rbPersistTone(toneIdx, rbState.currentSongFile);
