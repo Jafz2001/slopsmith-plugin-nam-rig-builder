@@ -3831,7 +3831,27 @@ async function rbApplyRsSettingsToVst(toneIdx, pIdx) {
     });
 
     let applied = 0, skipped = [];
+    // Static defaults first — curator-pinned params applied regardless of
+    // RS knobs (e.g. kHs Distortion Mode + Dynamics so fuzz pedals sound
+    // like fuzz, etc.). Values already normalized [0,1].
+    const staticBlock = mapping._static;
+    if (staticBlock && typeof staticBlock === 'object') {
+        for (const [pname, pval] of Object.entries(staticBlock)) {
+            const tid = nameToId[String(pname).toLowerCase()];
+            if (tid == null) { skipped.push(`_static.${pname} (param not on VST)`); continue; }
+            const v = Math.max(0, Math.min(1, parseFloat(pval)));
+            try {
+                await api.setParameter(piece._vst_slot_id, tid, v);
+                piece._vst_params = piece._vst_params || {};
+                piece._vst_params[tid] = v;
+                applied++;
+            } catch (e) {
+                skipped.push(`_static.${pname} (setParameter threw: ${e.message || e})`);
+            }
+        }
+    }
     for (const [rsKnobName, rule] of Object.entries(mapping)) {
+        if (rsKnobName === '_static') continue;   // handled above
         if (!(rsKnobName in rsKnobs)) { skipped.push(`${rsKnobName} (not on this gear)`); continue; }
         const rsValue = parseFloat(rsKnobs[rsKnobName]);
         if (isNaN(rsValue)) { skipped.push(`${rsKnobName} (NaN)`); continue; }
@@ -4140,23 +4160,49 @@ async function rbRestoreSavedParamsToSlot(api, slotId, savedParams) {
         try {
             const raw = await api.getParameters(slotId);
             if (Array.isArray(raw)) params = raw;
-        } catch (_) {}
+        } catch (e) {
+            console.warn('[rig_builder restore] getParameters threw:', e);
+        }
     }
-    if (!savedParams || typeof api.setParameter !== 'function') return params;
+    const savedKeys = savedParams ? Object.keys(savedParams) : [];
+    console.log(`[rig_builder restore] slot=${slotId} · ${params.length} live params · ${savedKeys.length} saved keys: ${savedKeys.slice(0, 6).join(', ')}${savedKeys.length > 6 ? '…' : ''}`);
+    if (!savedParams || typeof api.setParameter !== 'function') {
+        console.warn(`[rig_builder restore] slot=${slotId} — no saved params or no setParameter API, skipping`);
+        return params;
+    }
     const nameToId = {};
     params.forEach((p, idx) => {
         const pid = p.id ?? p.paramId ?? p.index ?? idx;
         const pname = (p.name ?? p.label ?? '').toLowerCase();
         if (pname) nameToId[pname] = pid;
     });
+    const sampleParam = params[0] || {};
+    console.log(`[rig_builder restore] slot=${slotId} · live param shape keys: ${Object.keys(sampleParam).join(', ')} · first 5 names: ${params.slice(0, 5).map(p => p.name || p.label || '<no-name>').join(' | ')}`);
+    let applied = 0;
+    const failed = [];
     for (const [pid, v] of Object.entries(savedParams)) {
         let targetId = parseInt(pid, 10);
+        let resolvedBy = 'numeric';
         if (isNaN(targetId) || String(targetId) !== String(pid).trim()) {
             targetId = nameToId[String(pid).toLowerCase()];
+            resolvedBy = (targetId != null) ? 'name' : 'unresolved';
         }
-        if (targetId == null || isNaN(targetId)) continue;
+        if (targetId == null || isNaN(targetId)) {
+            failed.push(`${pid}(${resolvedBy})`);
+            continue;
+        }
         const clamped = Math.max(0, Math.min(1, parseFloat(v)));
-        try { await api.setParameter(slotId, targetId, clamped); } catch (_) {}
+        try {
+            await api.setParameter(slotId, targetId, clamped);
+            applied++;
+        } catch (e) {
+            failed.push(`${pid}→${targetId}(setParam threw: ${e.message || e})`);
+        }
+    }
+    if (failed.length) {
+        console.warn(`[rig_builder restore] slot=${slotId}: applied ${applied}, FAILED: ${failed.join(', ')}`);
+    } else {
+        console.log(`[rig_builder restore] slot=${slotId}: applied ${applied}/${savedKeys.length} saved params ✓`);
     }
     // Refresh so the caller sees the actual post-restore values.
     if (typeof api.getParameters === 'function') {

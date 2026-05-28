@@ -246,6 +246,20 @@ def _build_params_for_piece(
         return None
     out: dict = {}
     skipped: list = []
+    # Static defaults first — `_static` block in the mapping holds
+    # curator-pinned params applied regardless of RS knobs (e.g.
+    # kHs Distortion Mode + Dynamics, so every fuzz pedal sounds fuzzy
+    # without needing per-pedal Mode knob mapping). Already-normalized
+    # values in [0,1] — clamped defensively. RS-knob translations below
+    # may override these (rare, but explicit win).
+    static_block = vst_block.get("_static")
+    if isinstance(static_block, dict):
+        for pname, pvalue in static_block.items():
+            try:
+                v = float(pvalue)
+            except (ValueError, TypeError):
+                continue
+            out[pname] = max(0.0, min(1.0, v))
     for rs_knob, rs_value in knobs.items():
         m = vst_block.get(rs_knob)
         if not isinstance(m, dict) or "param" not in m:
