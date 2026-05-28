@@ -6588,36 +6588,6 @@ async function rbExportDefaults() {
     }
 }
 
-// Backfill the correct mic position for every existing cab preset_piece
-// by re-parsing each song's PSARC Cabinet.Key. Auto-only by default —
-// preserves any manual mic picks the user made via the per-song picker.
-async function rbRemapCabMics() {
-    const status = document.getElementById('rb-remap-cabs-status');
-    status.textContent = 'Walking every cab piece (re-reading PSARCs)…';
-    try {
-        const r = await fetch(`${RB_API}/remap_cab_mics`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ only_auto: true }),
-        });
-        const data = await r.json();
-        if (!r.ok) {
-            status.innerHTML = `<span class="text-red-400">Error: ${rbEsc(data.error || r.status)}</span>`;
-            return;
-        }
-        const c = data.counts || {};
-        const parts = [
-            `<strong class="text-green-400">${c.updated || 0} updated</strong>`,
-        ];
-        if (c.promoted_generic) parts.push(`${c.promoted_generic} promoted from "Cabinets" to real cab`);
-        parts.push(`${c.same || 0} already correct`);
-        parts.push(`${c.skipped_manual || 0} manual (left alone)`);
-        if (c.no_psarc) parts.push(`${c.no_psarc} PSARC unavailable`);
-        if (c.no_key) parts.push(`${c.no_key} no Cabinet.Key`);
-        if (c.no_mic_map) parts.push(`${c.no_mic_map} no mic map`);
-        if (c.missing_ir) parts.push(`${c.missing_ir} IR file missing`);
-        status.innerHTML = parts.join(' · ') + ` (across ${data.presets_affected} presets)`;
-    } catch (e) {
-        status.innerHTML = `<span class="text-red-400">${rbEsc(e.message)}</span>`;
-    }
-}
+// (rbRemapCabMics removed — _auto_fix_cab_mics_for_song now runs on
+// every /song fetch, so cab assignments self-heal at song-open time
+// without the user needing to visit Setup.)
