@@ -36,9 +36,11 @@
     <div id="rb-tab-song" class="rb-tab-panel hidden">
         <div class="flex gap-3 mb-6">
             <input type="text" id="rb-song-search" placeholder="Filename (e.g. 2minutes_p.psarc)"
+                   oninput="rbOnSongSearchInput()"
+                   onfocus="rbShowSongList()"
                    onkeydown="if(event.key==='Enter')rbListSongs()"
                    class="flex-1 bg-dark-700 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
-            <button onclick="rbListSongs()" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Search</button>
+            <button onclick="rbShowSongList(); rbListSongs()" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Search</button>
         </div>
         <div id="rb-song-list" class="space-y-1 mb-6"></div>
         <div id="rb-song-tones" class="space-y-6"></div>
@@ -188,24 +190,102 @@
          scan + preferences + extract tools + export defaults. Same
          DOM ids used by JS — only the layout was reorganised. -->
     <div id="rb-tab-settings" class="rb-tab-panel hidden">
+
+        <!-- Quick start — the recommended workflow for a fresh install or
+             a library that's just been re-extracted. Kept at the top of
+             Setup so the user always sees the 3 ordered steps before the
+             individual section cards underneath. -->
+        <div class="bg-emerald-900/15 border border-emerald-800/40 rounded-xl p-5 mb-6">
+            <h3 class="text-emerald-200 font-semibold mb-2">🚀 Quick start — how this plugin works</h3>
+            <p class="text-gray-400 text-sm mb-3">
+                Three ordered steps. After you've done them once, the plugin
+                self-heals new songs as you open them — you don't need to
+                come back here unless your Rocksmith install changes.
+            </p>
+            <ol class="text-sm text-gray-300 space-y-2 list-decimal pl-5">
+                <li>
+                    <span class="font-medium">Extract from gears.psarc</span>
+                    — populates the gear-map JSON, every gear's photo, and
+                    the cab IRs with mic-position metadata. Use the
+                    <span class="text-gray-400">Extract everything</span>
+                    card below.
+                </li>
+                <li>
+                    <span class="font-medium">Scan library &amp; auto-assign</span>
+                    — walks every song and assigns captures from the curated
+                    1-to-1 mappings only. Anything uncurated lands in
+                    <span class="text-amber-300">pending</span> for you to
+                    pick later. Tick the <span class="text-amber-300">⚠ Allow tone3000
+                    fuzzy fallback</span> box below if you want the plugin to
+                    auto-search tone3000 for uncurated gears instead.
+                </li>
+                <li>
+                    <span class="font-medium">Refine in the Gear catalog</span>
+                    — for each amp set <span class="text-emerald-300">🎚 Variants</span>
+                    (clean / crunch / dist), or assign a NAM/VST via
+                    <span class="text-indigo-300">📚 Library</span>. The
+                    Songs editor lets you tweak per-song mic position +
+                    gain variant + swap gear.
+                </li>
+            </ol>
+            <p class="text-[11px] text-gray-500 mt-3">
+                Re-extracting only refreshes the metadata (photos, IRs,
+                gear map). Your curated picks in
+                <code class="bg-dark-800 px-1 rounded">rs_to_real.json</code> are preserved
+                automatically. Songs already in the DB pick up the new mic
+                positions when you next open them; or click
+                <span class="text-gray-300">Rescan all</span> to apply
+                everywhere at once.
+            </p>
+        </div>
+
         <!-- Batch operations (was Dashboard) -->
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
-            <h3 class="text-white font-semibold mb-2">Map the entire library</h3>
-            <p class="text-gray-500 text-sm mb-4">
-                Parses every PSARC/sloppak and maps each gear to a tone3000
-                capture (preferring your default-capture map). Choose how it
-                treats songs you've already set up:
+            <h3 class="text-white font-semibold mb-2">Scan library &amp; auto-assign captures</h3>
+            <p class="text-gray-500 text-sm mb-3">
+                Walks every PSARC / sloppak in your library and, for each
+                gear in each tone, resolves a NAM / IR / VST in this order:
+                <span class="text-gray-400">(1)</span> reuse an assignment you've already made for that gear in
+                another song, <span class="text-gray-400">(2)</span> your curated picks
+                (<code class="bg-dark-800 px-1 rounded">default_captures.json</code> +
+                <code class="bg-dark-800 px-1 rounded">gain_variants</code>),
+                <span class="text-gray-400">(3)</span> a fresh tone3000 search + download —
+                unless you turn that step off below.
             </p>
+            <label class="flex items-start gap-2 mb-4 text-sm cursor-pointer">
+                <input type="checkbox" id="rb-allow-tone3000-fallback"
+                       onchange="rbSetAllowTone3000Fallback(this.checked)"
+                       class="mt-1 accent-amber-500">
+                <span class="text-gray-300">
+                    <span class="font-medium text-amber-300">⚠ Allow tone3000 fuzzy fallback</span>
+                    <span class="text-gray-500 ml-1">(opt-out from curated-only)</span>
+                    <div class="text-gray-500 mt-1 leading-snug">
+                        Leave <strong class="text-gray-400">unchecked</strong> (recommended) and the plugin
+                        will only use the curated 1-to-1 mappings in
+                        <code class="bg-dark-800 px-1 rounded">rs_to_real.json</code> +
+                        <code class="bg-dark-800 px-1 rounded">default_captures.json</code>.
+                        Gears without a curated default land in
+                        <span class="text-amber-300">pending</span> — you assign them
+                        manually via Gear → 📚 Library / 🎚 Variants.
+                    </div>
+                    <div class="text-gray-500 mt-1 leading-snug">
+                        Check this box only if your library has lots of uncurated
+                        gear and you want the plugin to fuzzy-search tone3000 and
+                        auto-download a "best guess" capture for each. The shipped
+                        repo is fully curated, so most users should leave it off.
+                    </div>
+                </span>
+            </label>
             <div class="flex flex-wrap gap-3">
                 <button class="rb-batch-btn bg-dark-600 hover:bg-dark-500 text-gray-200 px-5 py-2 rounded-xl text-sm transition"
                         onclick="rbStartBatch('new')"
-                        title="Only map songs that have no preset yet — never touches what you've already configured">
-                    Map new songs only
+                        title="Only assign for songs that have no preset yet — never touches what you've already configured">
+                    Scan only new songs
                 </button>
                 <button class="rb-batch-btn bg-accent hover:bg-accent/80 text-white px-5 py-2 rounded-xl text-sm transition"
                         onclick="rbStartBatch('all')"
-                        title="(Re)map every song with the current/default presets. Re-resolves captures but keeps each tone's bypass and chosen cab-IR variant">
-                    Remap all
+                        title="Rescan every song. Re-resolves captures with the current/default presets. Preserves per-tone bypass + manual swaps (assigned_mode='manual')">
+                    Rescan all (keeps manual edits)
                 </button>
             </div>
             <div id="rb-batch-progress" class="hidden mt-4">
@@ -219,6 +299,31 @@
                 </div>
                 <pre id="rb-batch-log" class="mt-3 text-xs text-gray-500 max-h-48 overflow-auto bg-dark-900/50 p-2 rounded"></pre>
             </div>
+        </div>
+
+        <!-- Extract from gears.psarc — first step of the Quick start
+             workflow, surfaced here (right under Scan) so the user
+             doesn't have to scroll past the other Settings cards to
+             find it. Same handler, same status div as before — only
+             the position in the Setup tab changed. -->
+        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
+            <h3 class="text-white font-semibold mb-3">Extract from gears.psarc</h3>
+            <p class="text-gray-500 text-sm mb-3">
+                Point this at your game's
+                <code class="bg-dark-800 px-1 rounded">gears.psarc</code> (the gear
+                archive — <strong>not</strong> <code class="bg-dark-800 px-1 rounded">guitars.psarc</code>).
+                It rebuilds the gear map, extracts every gear's photo, and pulls
+                the cab IRs — all in one step. Re-run it whenever Rocksmith
+                ships new gear; your curated picks in <code class="bg-dark-800 px-1 rounded">rs_to_real.json</code>
+                are preserved automatically.
+            </p>
+            <div class="flex gap-3 mb-2">
+                <input type="text" id="rb-all-psarc" placeholder="/path/to/gears.psarc"
+                       class="flex-1 bg-dark-800 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+                <button onclick="rbBrowseForPsarc('rb-all-psarc')" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Browse…</button>
+                <button onclick="rbExtractAll()" class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-sm transition">Extract</button>
+            </div>
+            <div id="rb-extract-all-status" class="text-xs text-gray-500"></div>
         </div>
 
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mb-6">
@@ -304,24 +409,6 @@
         </div>
 
         <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5">
-            <h3 class="text-white font-semibold mb-3">Set up Rocksmith gear</h3>
-            <p class="text-gray-500 text-sm mb-3">
-                Point this at your game's
-                <code class="bg-dark-800 px-1 rounded">gears.psarc</code> (the gear
-                archive — <strong>not</strong> <code class="bg-dark-800 px-1 rounded">guitars.psarc</code>).
-                It rebuilds the gear map and extracts the cab IRs in one step.
-                Re-run it whenever Rocksmith ships new gear.
-            </p>
-            <div class="flex gap-3 mb-2">
-                <input type="text" id="rb-all-psarc" placeholder="/path/to/gears.psarc"
-                       class="flex-1 bg-dark-800 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
-                <button onclick="rbBrowseForPsarc('rb-all-psarc')" class="bg-dark-600 hover:bg-dark-500 text-gray-300 px-4 py-2 rounded-lg text-sm transition">Browse…</button>
-                <button onclick="rbExtractAll()" class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-sm transition">Extract</button>
-            </div>
-            <div id="rb-extract-all-status" class="text-xs text-gray-500"></div>
-        </div>
-
-        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-5 mt-6">
             <h3 class="text-white font-semibold mb-3">Export my mappings as defaults</h3>
             <p class="text-gray-500 text-sm mb-3">
                 Snapshot your current gear → tone3000 capture choices into

@@ -41,6 +41,68 @@ log = logging.getLogger("slopsmith.plugin.rig_builder")
 
 _plugin_dir = Path(__file__).parent
 
+# Rocksmith gear photos extracted by extract_gear_photos.py live in
+# per-category subdirs of the plugin folder. We accept several naming
+# conventions because the script's default has changed over time —
+# `amp_photos/` (current), `guitar_amp_photos/` (when guitar + bass amps
+# are kept separate), plus an optional `bass_amp_photos/`. The lookup
+# falls through to whichever exists.
+_GEAR_PHOTO_DIRS = (
+    "amp_photos", "guitar_amp_photos", "bass_amp_photos",
+    "pedal_photos", "rack_photos", "cab_photos",
+)
+
+
+def _find_gear_photo(rs_gear: str) -> Path | None:
+    """Locate the PNG for a Rocksmith gear if extract_gear_photos.py
+    has been run. The script names files `<rs_gear> - <name>.png`, so
+    the primary lookup is a prefix match across every known photo dir.
+
+    Two layers of fuzziness needed because the rs_gear "spelling" differs
+    between data sources:
+
+    1. **Case-insensitive comparison**. The DB stores brand-prefixed
+       codenames in ALL CAPS (`Bass_Cab_EDEND212XLT`,
+       `Cab_MARSHALL1960A`) but extract_gear_photos.py and rs_to_real
+       use the proper case (`Bass_Cab_EdenD212XLT`,
+       `Cab_Marshall1960A`). The mismatch silently dropped every
+       branded cab from the photo lookup.
+    2. **Cab base-form fallback**. Songs reference cabs by the BASE
+       rs_gear (e.g. `Bass_Cab_AT1150BC`) but the photos are per
+       mic-position variant (`Bass_Cab_AT1150BC_5c - ...png`, `_5e`, …
+       — same texture). When the exact prefix has no hit, accept the
+       first `<rs_gear>_<short>` variant we find. The "short" guard
+       (a ` - ` separator within 3 chars of the underscore) keeps
+       `Cab_TW40` from accidentally matching `Cab_TW400_5c`.
+
+    Returns None when no photo exists (UI falls back to a placeholder).
+    """
+    if not rs_gear:
+        return None
+    prefix = f"{rs_gear} - ".lower()
+    variant_prefix = f"{rs_gear}_".lower()
+    fallback: Path | None = None
+    for sub in _GEAR_PHOTO_DIRS:
+        d = _plugin_dir / sub
+        if not d.is_dir():
+            continue
+        try:
+            for p in d.iterdir():
+                if not p.is_file() or p.suffix.lower() != ".png":
+                    continue
+                name_lc = p.name.lower()
+                if name_lc.startswith(prefix):
+                    return p
+                if fallback is None and name_lc.startswith(variant_prefix):
+                    rest = name_lc[len(variant_prefix):]
+                    sep = rest.find(" - ")
+                    if 0 < sep <= 3:
+                        fallback = p
+        except OSError:
+            continue
+    return fallback
+
+
 # Module-level singletons populated by setup(). They start as None so
 # tests / linting on import don't blow up; _require_*() helpers turn
 # accidental pre-setup access into clear errors instead of AttributeError.
@@ -53,6 +115,7 @@ _lock = threading.Lock()
 
 _rs_to_real: dict | None = None
 _rs_cab_to_ir: dict | None = None
+_rs_cab_mic_map: dict | None = None
 _default_captures: dict | None = None  # gear -> {tone3000_id, kind, model_id}
 _settings: dict | None = None  # tone3000_api_key, min_downloads, aggressive
 
@@ -128,6 +191,17 @@ _DEFAULT_SETTINGS = {
     "tone3000_username": "",
     "min_downloads": 50,
     "aggressive": False,
+    # Curated-only mode. When True, the batch + per-song auto-assign
+    # ONLY pull captures from the user's curated 1-to-1 mappings
+    # (rs_to_real.json `gain_variants` for amps + default_captures.json
+    # for everything else). Existing assignments are still reused so a
+    # manual swap propagates across the library. Anything without a
+    # curated pick lands in "pending" instead of triggering a tone3000
+    # search — the curator picks it later via Gear → 📚 Library or
+    # 🎚 Variants. Default True now that the shipped rs_to_real.json
+    # has full coverage; users who prefer the legacy tone3000 fuzzy
+    # fallback can flip it off from Setup.
+    "curated_only": True,
     # v3 auto-download knobs.
     "preferred_size": "standard",       # standard | lite | feather | nano
     "auto_download": True,              # batch downloads files instead of just recording IDs
@@ -789,6 +863,27 @@ def _load_vst_seed_catalog() -> dict:
     return _vst_seed_catalog
 
 
+class _CaseInsensitiveDict(dict):
+    """A dict whose `.get(key)` falls back to a case-insensitive lookup
+    when the exact key isn't present. Used for the rs_cab_to_ir and
+    rs_cab_mic_map loaders because the DB stores some cab codenames
+    fully uppercased (`Cab_MARSHALL1960A`) while the source JSON uses
+    proper case (`Cab_Marshall1960A`). Pure dict otherwise — iteration
+    and len behave normally.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lower_index = {k.lower(): k for k in self.keys()}
+
+    def get(self, key, default=None):
+        if key in self:
+            return super().get(key)
+        real_key = self._lower_index.get(str(key).lower())
+        if real_key is None:
+            return default
+        return super().get(real_key, default)
+
+
 def _load_rs_cab_to_ir() -> dict:
     """Load (and cache) the rs_cab_to_ir.json map produced by
     extract_irs.py. Each key is a Rocksmith gear entity (e.g.
@@ -805,18 +900,53 @@ def _load_rs_cab_to_ir() -> dict:
         path = _plugin_dir / "rs_cab_to_ir.json"
         if path.exists():
             try:
-                _rs_cab_to_ir = json.loads(path.read_text())
+                _rs_cab_to_ir = _CaseInsensitiveDict(json.loads(path.read_text()))
             except json.JSONDecodeError:
                 log.error("rs_cab_to_ir.json is corrupt", exc_info=True)
-                _rs_cab_to_ir = {}
+                _rs_cab_to_ir = _CaseInsensitiveDict()
         else:
-            _rs_cab_to_ir = {}
+            _rs_cab_to_ir = _CaseInsensitiveDict()
     return _rs_cab_to_ir
 
 
 def _invalidate_rs_cab_to_ir() -> None:
-    global _rs_cab_to_ir
+    global _rs_cab_to_ir, _rs_cab_mic_map, _effect_to_mic_cache
     _rs_cab_to_ir = None
+    _rs_cab_mic_map = None
+    _effect_to_mic_cache = None
+
+
+def _load_rs_cab_mic_map() -> dict:
+    """Load (and cache) `rs_cab_mic_map.json` — the Wwise-HIRC-derived
+    table that maps each cab's mic-position suffix (`5c`, `cc`, `te`, …)
+    to the actual extracted IR file plus a friendly label
+    ("Dynamic Cone", "Condenser Edge", …). Produced by extract_irs.py.
+
+    Schema:
+      {
+        "Bass_Cab_AT1150BC": {
+          "5c": {ir_index, ir_file, mic_type, position, label, effect_name},
+          ...
+        },
+        ...
+      }
+
+    Returns {} if the user hasn't re-run extraction since the script
+    started emitting this file — in that case callers fall back to the
+    numbered IR list from rs_cab_to_ir.json (legacy behaviour).
+    """
+    global _rs_cab_mic_map
+    if _rs_cab_mic_map is None:
+        path = _plugin_dir / "rs_cab_mic_map.json"
+        if path.exists():
+            try:
+                _rs_cab_mic_map = _CaseInsensitiveDict(json.loads(path.read_text()))
+            except json.JSONDecodeError:
+                log.error("rs_cab_mic_map.json is corrupt", exc_info=True)
+                _rs_cab_mic_map = _CaseInsensitiveDict()
+        else:
+            _rs_cab_mic_map = _CaseInsensitiveDict()
+    return _rs_cab_mic_map
 
 
 # ── NAM/IR storage layout — category subdirs ─────────────────────────
@@ -1042,12 +1172,81 @@ def _parse_gear(gear: dict, slot_type: str) -> dict:
         clean_name = parts[-1] if len(parts) > 1 else k
         clean_knobs[clean_name] = round(v, 1) if isinstance(v, float) else v
 
-    return {
+    out = {
         "type": model_key,
         "slot": slot_type,
         "category": category,
         "knobs": clean_knobs,
     }
+
+    # Cabinet mic-position: Rocksmith encodes the specific cab + mic
+    # in `Cabinet.Key` (e.g. "Bass_Cab_AT810BC_Tube_Cone"), while
+    # `Cabinet.Type` is the literal string "Cabinets" for every cab.
+    # The .Key value is the Wwise Effect name — the same string our
+    # extract_irs mapping uses to resolve mic-position → IR.
+    #
+    # Surface it as a separate field so:
+    #   1. `_enrich_chain_piece` can promote it into rs_gear_type
+    #      (Bass_Cab_AT810BC) so the cab tab works against the base
+    #      cab in rs_cab_mic_map.
+    #   2. The auto-assign / chain build flow can pick the matching
+    #      IR file via rs_cab_mic_map.
+    if slot_type == "cabinet":
+        key = gear.get("Key") or ""
+        if key:
+            out["cabinet_key"] = key
+            # Promote `model_key` from generic "Cabinets" to the cab's
+            # base rs_gear (e.g. "Bass_Cab_AT810BC") so downstream lookups
+            # against rs_cab_to_ir / rs_cab_mic_map / photos all work.
+            # The mic suffix is NOT in `model_key` — it stays purely in
+            # `cabinet_key` so the per-piece variant override sees it.
+            base = _cab_base_from_effect_name(key)
+            if base:
+                out["type"] = base
+    return out
+
+
+# Cache for the inverse `Effect name → mic suffix` lookup so cab parsing
+# doesn't re-walk the whole mic map every time we see a Cabinet piece.
+_effect_to_mic_cache: dict[str, tuple[str, str]] | None = None
+
+
+def _build_effect_to_mic_index() -> dict[str, tuple[str, str]]:
+    """Walk rs_cab_mic_map once and build `{effect_name: (base_rs_gear,
+    suffix)}` keyed by lowercased effect name — case-insensitive so
+    Rocksmith's mixed-case Cabinet.Key values match cleanly."""
+    global _effect_to_mic_cache
+    if _effect_to_mic_cache is None:
+        idx: dict[str, tuple[str, str]] = {}
+        for base, mics in (_load_rs_cab_mic_map() or {}).items():
+            for suffix, info in (mics or {}).items():
+                ename = (info or {}).get("effect_name") or ""
+                if ename:
+                    idx[ename.lower()] = (base, suffix)
+        _effect_to_mic_cache = idx
+    return _effect_to_mic_cache
+
+
+def _cab_base_from_effect_name(effect_name: str) -> str | None:
+    """Resolve a PSARC Cabinet.Key (e.g. "Bass_Cab_AT810BC_Tube_Cone")
+    back to its base rs_gear ("Bass_Cab_AT810BC"). Uses the mic-map
+    inverse index so the base form matches what rs_cab_to_ir +
+    rs_cab_mic_map are keyed by. Returns None when the effect name
+    isn't in the index (e.g. cab not extracted or mic map outdated).
+    """
+    if not effect_name:
+        return None
+    base_suffix = _build_effect_to_mic_index().get(effect_name.lower())
+    return base_suffix[0] if base_suffix else None
+
+
+def _cab_suffix_from_effect_name(effect_name: str) -> str | None:
+    """Resolve a PSARC Cabinet.Key to the mic-position suffix ('5c',
+    'cc', 'tc', …). Returns None when not found."""
+    if not effect_name:
+        return None
+    base_suffix = _build_effect_to_mic_index().get(effect_name.lower())
+    return base_suffix[1] if base_suffix else None
 
 
 def _parse_tone(tone_data: dict) -> dict:
@@ -1409,12 +1608,35 @@ def _enrich_chain_piece(piece: dict, img_idx: dict | None = None) -> dict:
     # extract_irs.py) doesn't surface broken references — the UI just
     # falls back to the tone3000 deep-link for that cab.
     rs_irs: list[str] = []
+    cab_mic_variants: list[dict] = []
     if category == "cab":
         rs_entry = _load_rs_cab_to_ir().get(rs_type) or {}
         candidates = list(rs_entry.get("irs") or [])
         irs_root = _config_dir / "nam_irs" if _config_dir else None
         if irs_root:
             rs_irs = [f for f in candidates if (irs_root / f).exists()]
+        # Per-mic-position list — same shape as the catalog enrichment so
+        # the song editor can render labeled audition buttons ("Dynamic
+        # Cone", "Condenser Edge", "Tube Off-axis", …) instead of a raw
+        # filename dropdown. Sorted by ir_index for stable layout.
+        mic_map = _load_rs_cab_mic_map().get(rs_type) or {}
+        if mic_map and irs_root is not None:
+            for suffix, entry in sorted(
+                    mic_map.items(),
+                    key=lambda kv: kv[1].get("ir_index", 99)):
+                f = entry.get("ir_file")
+                available = (
+                    bool(f) and (irs_root / f).exists()
+                )
+                cab_mic_variants.append({
+                    "suffix": suffix,
+                    "ir_index": entry.get("ir_index"),
+                    "ir_file": f,
+                    "label": entry.get("label") or suffix,
+                    "mic_type": entry.get("mic_type"),
+                    "position": entry.get("position"),
+                    "available": available,
+                })
 
     # Amp gain variant info — only relevant when the curator has
     # actually shipped `gain_variants` for this amp in rs_to_real.json.
@@ -1429,10 +1651,48 @@ def _enrich_chain_piece(piece: dict, img_idx: dict | None = None) -> dict:
         variants = info.get("gain_variants") or {}
         if variants:
             picked = _pick_amp_gain_variant(info, _gear_rs_gain(piece, info))
+            # Map the currently-assigned NAM back to a level name
+            # ("clean"/"crunch"/"dist") so the UI can highlight the
+            # button the user is actually hearing.
+            #
+            # NOTE: tone3000_id can be IDENTICAL across all variants of
+            # an amp (when the curator picked multiple captures from the
+            # same tone3000 page — model_id differs, tone3000_id doesn't).
+            # If we matched by tone3000_id alone we'd always return the
+            # first variant in the dict ("clean"), which is the bug the
+            # UI was hitting. So match by the resolved file BASENAME —
+            # each variant has unique `notes` → unique filename.
+            assigned_file = (assigned or {}).get("file") or ""
+            assigned_basename = (
+                assigned_file.rsplit("/", 1)[-1] if assigned_file else ""
+            )
+            current_level = None
+            if assigned_basename:
+                for lvl, spec in variants.items():
+                    if not isinstance(spec, dict):
+                        continue
+                    notes = (spec.get("notes") or "").strip()
+                    if notes:
+                        expected = f"{_safe_filename_human(notes)}.nam"
+                        if expected == assigned_basename:
+                            current_level = lvl
+                            break
+                    # Legacy filename fallback: tone3000_<tid>_m<mid>_<gear>.nam.
+                    tid = spec.get("tone3000_id")
+                    mid = spec.get("model_id")
+                    if tid and mid:
+                        legacy = (
+                            f"tone3000_{tid}_m{mid}_"
+                            f"{_safe_filename(rs_type)}.nam"
+                        )
+                        if legacy == assigned_basename:
+                            current_level = lvl
+                            break
             amp_variant_info = {
                 "available": list(variants.keys()),
                 "picked": (picked or {}).get("_picked_level"),
                 "picked_id": (picked or {}).get("tone3000_id"),
+                "current_level": current_level,
                 "rs_gain": _gear_rs_gain(piece, info),
             }
 
@@ -1447,6 +1707,11 @@ def _enrich_chain_piece(piece: dict, img_idx: dict | None = None) -> dict:
         "tone3000_platform": platform,
         "tone3000_search_url": deep_link,
         "rs_irs": rs_irs,
+        # Labeled mic-position picker for cab pieces (Dynamic Cone,
+        # Condenser Edge, …). Empty when the cab has no entry in
+        # rs_cab_mic_map.json (e.g. the user hasn't re-run extract_irs
+        # since we started emitting the map).
+        "cab_mic_variants": cab_mic_variants,
         "amp_variant": amp_variant_info,
         "assigned": assigned,
     }
@@ -2980,11 +3245,32 @@ def _batch_worker(mode: str = "all"):
                     available = [f for f in rs_ir_files if (irs_root / f).exists()]
                     if category == "cab" and available:
                         _prev = existing_by_gear.get(rs_type, {})
-                        # Keep the user's chosen mic-position variant if it's
-                        # still on disk; otherwise default to the first.
-                        _cab_file = (_prev.get("file")
-                                     if _prev.get("kind") == "rs_ir" and _prev.get("file") in available
-                                     else available[0])
+                        # IR pick order:
+                        #   1. Keep the user's saved variant if it's still
+                        #      on disk (their explicit mic-position choice).
+                        #   2. Use the song's Cabinet.Key to pick the
+                        #      mic-specific IR via rs_cab_mic_map — this is
+                        #      what Rocksmith's tone designer originally
+                        #      specified. Previously this branch defaulted
+                        #      to `available[0]` (always _00.wav) and
+                        #      ignored Cabinet.Key, so every cab played
+                        #      with the SM57-condenser-close mic regardless
+                        #      of the song's intent.
+                        #   3. Fall back to the first available IR.
+                        _cab_file = None
+                        if _prev.get("kind") == "rs_ir" and _prev.get("file") in available:
+                            _cab_file = _prev.get("file")
+                        if _cab_file is None:
+                            cabinet_key = piece.get("cabinet_key") or ""
+                            if cabinet_key:
+                                suffix = _cab_suffix_from_effect_name(cabinet_key)
+                                if suffix:
+                                    spec = (_load_rs_cab_mic_map().get(rs_type) or {}).get(suffix)
+                                    cand = (spec or {}).get("ir_file")
+                                    if cand and (irs_root / cand).exists():
+                                        _cab_file = cand
+                        if _cab_file is None:
+                            _cab_file = available[0]
                         pieces.append({
                             "slot": piece["slot"],
                             "rs_gear_type": rs_type,
@@ -3016,6 +3302,7 @@ def _batch_worker(mode: str = "all"):
                         elif client.has_api_access and query:
                             try:
                                 from tone3000_client import pick_top_candidate
+                                top = None
                                 if amp_variant:
                                     # Curated variant wins: use its
                                     # tone3000_id directly. No search.
@@ -3028,6 +3315,12 @@ def _batch_worker(mode: str = "all"):
                                     _dflt = _load_default_captures().get(rs_type)
                                     if _dflt and _dflt.get("tone3000_id"):
                                         top = {"id": _dflt["tone3000_id"], "title": "default"}
+                                    elif settings.get("curated_only", False):
+                                        # Curator mode: no fuzzy search.
+                                        # Without a curated default or an
+                                        # existing assignment, the gear
+                                        # is left for the curator to pick.
+                                        top = None
                                     else:
                                         resp = client.search_tones(query, gears=gears or None, platform=platform, page_size=5)
                                         top = pick_top_candidate(
@@ -3234,17 +3527,32 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                     continue
 
                 # Cab fast-path: prefer the Rocksmith IR when on disk.
+                # Use the song's `Cabinet.Key` (the Wwise Effect name —
+                # e.g. "Bass_Cab_AT810BC_Tube_Cone") to pick the CORRECT
+                # mic position via rs_cab_mic_map. Falls back to the
+                # first IR in the list when the cab has no mic-map
+                # entry (older cabs, novelty cabs, etc.) so the legacy
+                # "always _00" behaviour stays as a safety net.
                 rs_ir_entry = rs_irs_map.get(rs_type) or {}
                 available = [
                     f for f in (rs_ir_entry.get("irs") or [])
                     if (irs_root / f).exists()
                 ]
                 if category == "cab" and available:
+                    chosen_file = available[0]
+                    cabinet_key = piece.get("cabinet_key") or ""
+                    if cabinet_key:
+                        suffix = _cab_suffix_from_effect_name(cabinet_key)
+                        if suffix:
+                            spec = (_load_rs_cab_mic_map().get(rs_type) or {}).get(suffix)
+                            cand = (spec or {}).get("ir_file")
+                            if cand and (irs_root / cand).exists():
+                                chosen_file = cand
                     pieces.append({
                         "slot": piece["slot"],
                         "rs_gear_type": rs_type,
                         "kind": "rs_ir",
-                        "file": available[0],
+                        "file": chosen_file,
                         "params": piece["knobs"],
                         "tone3000_id": None,
                         "assigned_mode": "auto",
@@ -3261,6 +3569,7 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                     cached = {}
                     try:
                         from tone3000_client import pick_top_candidate
+                        top = None
                         if amp_variant:
                             # Curated variant wins: no search, just use
                             # the tone3000_id the curator chose for this
@@ -3274,6 +3583,12 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                             _dflt = _load_default_captures().get(rs_type)
                             if _dflt and _dflt.get("tone3000_id"):
                                 top = {"id": _dflt["tone3000_id"], "title": "default"}
+                            elif settings.get("curated_only", False):
+                                # Curated-only: skip tone3000 fuzzy search.
+                                # The piece will land in pending — the
+                                # curator picks it manually via
+                                # Gear → 📚 Library / 🎚 Variants.
+                                top = None
                             else:
                                 resp = client.search_tones(
                                     query, gears=gears or None, platform=platform, page_size=5,
@@ -3469,9 +3784,107 @@ def _watch_fire(name: str) -> None:
             "downloaded": result.get("downloaded"),
         }
         log.info("rig_builder watcher auto-downloaded %s: %s", name, result)
+        # Also fix cab assignments right after the download. Materialised
+        # songs whose DLC PSARC ships `Cabinet.Type='Cabinets'` get the
+        # real cab + correct mic IR baked into preset_pieces here — the
+        # user doesn't need to open the song in the editor for the fix
+        # to land. Idempotent: already-correct rows are no-ops.
+        try:
+            if path.suffix.lower() == ".sloppak":
+                raw_tones = _read_tones_from_sloppak(name, _get_dlc_dir())
+            else:
+                raw_tones = _read_tones_from_psarc(path)
+            _auto_fix_cab_mics_for_song_module(name, raw_tones)
+        except Exception:
+            log.exception("rig_builder watcher cab-mic fix failed for %s", name)
     except Exception as e:
         log.exception("rig_builder watcher auto-download failed for %s", name)
         _watcher_state["last_error"] = f"{name}: {type(e).__name__}: {e}"
+
+
+def _auto_fix_cab_mics_for_song_module(filename: str, raw_tones: list) -> int:
+    """Module-level version of the per-song cab-mic fixer (the closure
+    `_auto_fix_cab_mics_for_song` inside setup() captures `conn`/`_lock`
+    via the outer scope; this twin is callable from the watcher + the
+    playback path without going through the FastAPI handler).
+
+    Walks each tone's Cabinet.Key, resolves to (base_rs_gear, suffix)
+    via rs_cab_mic_map, and updates every preset_piece for that tone
+    so rs_gear_type + file land on the correct cab + mic IR. Skips
+    real manual picks (assigned_mode='manual' AND a real rs_gear_type
+    that isn't 'Cabinets'); always force-fixes the generic 'Cabinets'
+    placeholder. Returns the number of rows updated.
+    """
+    if _config_dir is None or not raw_tones:
+        return 0
+    irs_root = _config_dir / "nam_irs"
+    conn = _get_conn()
+    base_name = filename.rsplit("/", 1)[-1]
+    tm_rows = conn.execute(
+        "SELECT tone_key, preset_id FROM tone_mappings "
+        "WHERE filename = ? OR filename = ?",
+        (filename, base_name),
+    ).fetchall()
+    if not tm_rows:
+        return 0
+    tone_to_preset = {tk: pid for tk, pid in tm_rows}
+    updated = 0
+    affected: set[int] = set()
+    with _lock:
+        for raw in raw_tones:
+            tone_key = raw.get("Key") or raw.get("Name") or ""
+            preset_id = tone_to_preset.get(tone_key)
+            if preset_id is None:
+                continue
+            cab = (raw.get("GearList") or {}).get("Cabinet") or {}
+            effect_name = (cab.get("Key") or "").strip()
+            if not effect_name:
+                continue
+            base_rs_gear = _cab_base_from_effect_name(effect_name)
+            suffix = _cab_suffix_from_effect_name(effect_name)
+            if not base_rs_gear or not suffix:
+                continue
+            spec = (_load_rs_cab_mic_map().get(base_rs_gear) or {}).get(suffix)
+            new_file = (spec or {}).get("ir_file")
+            if not new_file or not (irs_root / new_file).exists():
+                continue
+            base_lc = base_rs_gear.lower()
+            rows = conn.execute(
+                "SELECT id, rs_gear_type, file, assigned_mode "
+                "FROM preset_pieces "
+                "WHERE preset_id = ? "
+                "  AND (rs_gear_type = 'Cabinets' "
+                "       OR LOWER(rs_gear_type) = ? "
+                "       OR LOWER(rs_gear_type) LIKE ?)",
+                (preset_id, base_lc, base_lc + "_%"),
+            ).fetchall()
+            for row_id, rs_gear, cur_file, mode in rows:
+                is_generic = (rs_gear == "Cabinets")
+                if mode == "manual" and not is_generic:
+                    continue
+                needs_promote = (rs_gear != base_rs_gear)
+                if not needs_promote and cur_file == new_file:
+                    continue
+                if needs_promote:
+                    conn.execute(
+                        "UPDATE preset_pieces "
+                        "SET rs_gear_type = ?, file = ?, kind = 'rs_ir' "
+                        "WHERE id = ?",
+                        (base_rs_gear, new_file, row_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE preset_pieces "
+                        "SET file = ?, kind = 'rs_ir' WHERE id = ?",
+                        (new_file, row_id),
+                    )
+                updated += 1
+                affected.add(preset_id)
+        if updated:
+            for pid in affected:
+                _recompute_preset_primaries(conn, pid)
+            conn.commit()
+    return updated
 
 
 def _start_watcher() -> None:
@@ -3729,6 +4142,77 @@ def setup(app, context):
         _invalidate_rs_to_real()
         return {"ok": True, "stdout": result.stdout, "count": len(_load_rs_to_real())}
 
+    # (POST /remap_cab_mics removed — `_auto_fix_cab_mics_for_song`
+    # runs inside GET /song/{filename} on every open, so cab
+    # assignment self-heals there. A separate batch endpoint is
+    # redundant: songs whose PSARCs aren't materialized yet can't
+    # be fixed in bulk anyway, and the per-open path catches them
+    # naturally when the user actually opens them.)
+
+    @app.post("/api/plugins/rig_builder/extract_gear_photos")
+    def extract_gear_photos(data: dict = Body(...)):
+        """Run extract_gear_photos.py against a user-supplied gears.psarc.
+
+        Pulls every amp / pedal / rack / cab texture out of the PSARC
+        and writes them into <plugin_dir>/{amp,pedal,rack,cab}_photos/ —
+        the same dirs `_find_gear_photo` walks when serving
+        GET /gear_photo. Re-run any time `rs_to_real.json` is rebuilt
+        so the photo set tracks the gear-map.
+
+        Pillow is the one external dep; if it's missing in the bundled
+        Python we surface the stderr so the user can spot the
+        `error: Pillow not installed` line. Otherwise this is fast
+        (~5-15 s on M1).
+        """
+        gears_psarc = data.get("gears_psarc")
+        if not gears_psarc or not Path(gears_psarc).exists():
+            return JSONResponse({"error": "gears_psarc not found"}, 400)
+        script = _plugin_dir / "extract_gear_photos.py"
+        if not script.exists():
+            return JSONResponse({"error": "extract_gear_photos.py missing"}, 500)
+        # Two things matter for the script to resolve cleanly when launched
+        # by the FastAPI host (whose CWD is wherever the user launched
+        # Slopsmith from — usually `/`):
+        #   - pass --rs-map ABSOLUTE so the script doesn't look for
+        #     `./rs_to_real.json` in CWD and bail.
+        #   - cwd=_plugin_dir as a belt-and-braces fallback for any
+        #     other relative path the script might use later.
+        rs_map_path = _plugin_dir / "rs_to_real.json"
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), gears_psarc,
+                 "--rs-map", str(rs_map_path),
+                 "--out", str(_plugin_dir)],
+                capture_output=True,
+                timeout=600,
+                text=True,
+                cwd=str(_plugin_dir),
+            )
+        except subprocess.TimeoutExpired:
+            return JSONResponse({"error": "extractor timed out"}, 500)
+        if result.returncode != 0:
+            return JSONResponse(
+                {"error": "extractor failed",
+                 "stderr": result.stderr[-2000:] if result.stderr else "",
+                 "stdout_tail": result.stdout[-1000:] if result.stdout else ""},
+                500,
+            )
+        # Count what's on disk so the UI can show a sensible summary.
+        counts: dict[str, int] = {}
+        total = 0
+        for sub in ("amp_photos", "pedal_photos", "rack_photos", "cab_photos"):
+            d = _plugin_dir / sub
+            n = len(list(d.glob("*.png"))) if d.exists() else 0
+            counts[sub] = n
+            total += n
+        return {
+            "ok": True,
+            "stdout": result.stdout,
+            "stderr_tail": result.stderr[-500:] if result.stderr else "",
+            "counts": counts,
+            "total": total,
+        }
+
     @app.get("/api/plugins/rig_builder/settings")
     def get_settings():
         s = _load_settings()
@@ -3738,6 +4222,7 @@ def setup(app, context):
         return {
             "min_downloads": s.get("min_downloads", 50),
             "aggressive": s.get("aggressive", False),
+            "curated_only": s.get("curated_only", False),
             "preferred_size": s.get("preferred_size", "standard"),
             "mega_chain_mode": s.get("mega_chain_mode", True),
             "bypass_all_cabs": s.get("bypass_all_cabs", False),
@@ -3757,6 +4242,8 @@ def setup(app, context):
         # `preferred_size` is restricted to the 4 valid sizes — anything else
         # falls back to "standard" so a typo can't break model picking.
         allowed = {k: data[k] for k in ("tone3000_api_key", "min_downloads", "aggressive") if k in data}
+        if "curated_only" in data:
+            allowed["curated_only"] = bool(data["curated_only"])
         if "preferred_size" in data:
             size = str(data["preferred_size"]).strip().lower()
             if size in ("standard", "lite", "feather", "nano"):
@@ -3947,6 +4434,112 @@ def setup(app, context):
 
     # ── Song / chain inspection ───────────────────────────────────────
 
+    def _auto_fix_cab_mics_for_song(filename: str, raw_tones: list,
+                                      conn) -> int:
+        """Auto-promote generic "Cabinets" rs_gear and re-pick mic IRs
+        when a song is opened. Runs synchronously inside get_song so the
+        chain rendered to the user always reflects the corrected cab.
+
+        For each parsed tone:
+          - Read its Cabinet.Key from the PSARC (e.g. "Bass_Cab_AT810BC_57_Cone")
+          - Resolve to (base_rs_gear, mic_suffix) via the HIRC-derived
+            rs_cab_mic_map.
+          - Find the preset_piece for THIS tone whose rs_gear_type is
+            either the resolved base, the generic "Cabinets" placeholder,
+            or a stale base-form (case-insensitive).
+          - If the row's current rs_gear / file doesn't match what
+            Cabinet.Key says it should be → UPDATE.
+
+        Preserves real manual picks: rows with assigned_mode='manual'
+        AND a real (non-generic) rs_gear_type stay untouched. The
+        generic-Cabinets rows ARE force-fixed regardless of mode
+        because the UI never lets the user pick "Cabinets" deliberately
+        — it's always a parser-miss placeholder.
+
+        Returns the number of rows updated (mostly for diagnostics —
+        not surfaced to the user; the corrected state shows up in the
+        re-rendered chain).
+        """
+        if _config_dir is None or not raw_tones:
+            return 0
+        irs_root = _config_dir / "nam_irs"
+        # tone_mappings.filename → preset_id (case-insensitive on the
+        # basename to handle subdir prefixes).
+        base = filename.rsplit("/", 1)[-1]
+        tm_rows = conn.execute(
+            "SELECT tone_key, preset_id FROM tone_mappings "
+            "WHERE filename = ? OR filename = ?",
+            (filename, base),
+        ).fetchall()
+        if not tm_rows:
+            return 0
+        tone_to_preset = {tk: pid for tk, pid in tm_rows}
+
+        updated = 0
+        with _lock:
+            for raw in raw_tones:
+                tone_key = raw.get("Key") or raw.get("Name") or ""
+                preset_id = tone_to_preset.get(tone_key)
+                if preset_id is None:
+                    continue
+                cab = (raw.get("GearList") or {}).get("Cabinet") or {}
+                effect_name = (cab.get("Key") or "").strip()
+                if not effect_name:
+                    continue
+                base_rs_gear = _cab_base_from_effect_name(effect_name)
+                suffix = _cab_suffix_from_effect_name(effect_name)
+                if not base_rs_gear or not suffix:
+                    continue
+                spec = (_load_rs_cab_mic_map().get(base_rs_gear) or {}).get(suffix)
+                new_file = (spec or {}).get("ir_file")
+                if not new_file or not (irs_root / new_file).exists():
+                    continue
+                # Find the cab preset_piece for this preset. Match by
+                # category-ish criteria: rs_gear is "Cabinets", or
+                # case-insensitively equals the resolved base, or a
+                # stale variant of it.
+                base_lc = base_rs_gear.lower()
+                rows = conn.execute(
+                    "SELECT id, rs_gear_type, file, assigned_mode "
+                    "FROM preset_pieces "
+                    "WHERE preset_id = ? "
+                    "  AND (rs_gear_type = 'Cabinets' "
+                    "       OR LOWER(rs_gear_type) = ? "
+                    "       OR LOWER(rs_gear_type) LIKE ?)",
+                    (preset_id, base_lc, base_lc + "_%"),
+                ).fetchall()
+                for row_id, rs_gear, cur_file, mode in rows:
+                    is_generic = (rs_gear == "Cabinets")
+                    # Skip real manual picks. Generic-Cabinets rows are
+                    # always force-fixed (parser-miss, not deliberate).
+                    if mode == "manual" and not is_generic:
+                        continue
+                    needs_promote = (rs_gear != base_rs_gear)
+                    if not needs_promote and cur_file == new_file:
+                        continue
+                    if needs_promote:
+                        conn.execute(
+                            "UPDATE preset_pieces "
+                            "SET rs_gear_type = ?, file = ?, kind = 'rs_ir' "
+                            "WHERE id = ?",
+                            (base_rs_gear, new_file, row_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE preset_pieces "
+                            "SET file = ?, kind = 'rs_ir' WHERE id = ?",
+                            (new_file, row_id),
+                        )
+                    updated += 1
+            if updated:
+                # Recompute primary IR file on every preset we touched.
+                affected = {tone_to_preset[k] for k in tone_to_preset
+                             if tone_to_preset[k] is not None}
+                for pid in affected:
+                    _recompute_preset_primaries(conn, pid)
+                conn.commit()
+        return updated
+
     @app.get("/api/plugins/rig_builder/song/{filename:path}")
     def get_song(filename: str):
         path = _resolve_song_file(filename)
@@ -3986,6 +4579,17 @@ def setup(app, context):
         # Map tone_key → existing nam_tone mapping (if any), so the UI
         # can show which tones already have a preset and which don't.
         conn = _get_conn()
+        # Self-healing cab assignment: every song open re-evaluates
+        # each cab piece against its PSARC's Cabinet.Key. Updates
+        # rows whose rs_gear_type='Cabinets' (parser-miss placeholder)
+        # or whose mic IR doesn't match what Rocksmith actually
+        # specified for the tone. Real manual picks (manual mode + real
+        # rs_gear) stay protected. Idempotent — already-correct rows
+        # are no-ops, so re-opening a fixed song doesn't churn.
+        try:
+            _auto_fix_cab_mics_for_song(filename, raw_tones, conn)
+        except Exception:
+            log.exception("auto cab mic fix failed for %s", filename)
         existing_rows = conn.execute(
             "SELECT tone_key, preset_id FROM tone_mappings WHERE filename = ?",
             (filename,),
@@ -5164,15 +5768,21 @@ def setup(app, context):
         return {"ok": True, "pieces_updated": cur.rowcount}
 
     @app.get("/api/plugins/rig_builder/local_files")
-    def local_files(kind: str = "nam"):
+    def local_files(kind: str = "nam", category: str = ""):
         """List all locally-available NAM models or IR WAVs that the user
         could pick for a piece, with usage stats so the UI can sort by
         most-used first.
 
         Query:
-          - kind: "nam" → lists nam_models/*.nam
-                  "ir"  → lists nam_irs/**/*.wav (recursive, includes the
-                          extract_irs.py output under nam_irs/rocksmith/)
+          - kind:     "nam" → lists nam_models/**/*.nam (recursive, post-v1.2
+                              files live in amps/ pedals/ racks/ other/)
+                      "ir"  → lists nam_irs/**/*.wav (recursive, includes the
+                              extract_irs.py output under nam_irs/rocksmith/)
+          - category: optional. "amp"|"pedal"|"rack"|"cab" — restricts the
+                      walk to the matching subdir (amps/pedals/racks/cabs)
+                      so the per-piece Library picker doesn't dump every
+                      NAM in the user's library on an amp slot. Falls back
+                      to listing everything if the subdir doesn't exist.
 
         Returns:
           {"files": [
@@ -5192,19 +5802,31 @@ def setup(app, context):
         if kind == "nam":
             root = _config_dir / "nam_models"
             ext = ".nam"
-            recursive = False
         elif kind in ("ir", "wav"):
             root = _config_dir / "nam_irs"
             ext = ".wav"
-            recursive = True
         else:
             return JSONResponse({"error": f"unknown kind: {kind}"}, 400)
         if not root.exists():
             return {"files": []}
-        # Walk filesystem.
+        # Optional category narrowing — map external category → subdir.
+        # Falls through to the full root walk if the subdir is missing,
+        # which keeps the picker working for users still on pre-v1.2
+        # flat storage.
+        scoped_root = root
+        if category:
+            cat = (category or "").lower()
+            subdir = None
+            if kind == "nam":
+                subdir = {"amp": "amps", "pedal": "pedals",
+                          "rack": "racks", "other": "other"}.get(cat)
+            else:
+                subdir = {"cab": "cabs", "other": "other"}.get(cat)
+            if subdir and (root / subdir).exists():
+                scoped_root = root / subdir
+        # Walk filesystem (always recursive now to support subdir layout).
         paths: list = []
-        iterator = root.rglob(f"*{ext}") if recursive else root.glob(f"*{ext}")
-        for p in iterator:
+        for p in scoped_root.rglob(f"*{ext}"):
             if p.is_file():
                 paths.append(p)
         # Build a single SQL query to fetch usage stats for ALL files at once
@@ -5413,6 +6035,38 @@ def setup(app, context):
                 })
             return out
 
+        # Cab mic-variants enrichment: for every cab in the user's
+        # catalog, look up the rs_cab_mic_map entry (built from the
+        # Wwise HIRC ↔ DIDX cross-reference). Each entry returns the
+        # extracted IR file + a friendly label so the UI can render
+        # one ▶ per mic position instead of generic "IR 0/1/2/…".
+        # Filtering by `(irs_root / file).exists()` keeps the picker
+        # honest: if the user hasn't re-extracted, only the variants
+        # whose .wav landed on disk show as auditionable.
+        mic_map = _load_rs_cab_mic_map()
+        irs_root = _config_dir / "nam_irs" if _config_dir else None
+
+        def _mic_variants_for(rs_gear: str) -> list[dict]:
+            spec = mic_map.get(rs_gear) or {}
+            out = []
+            for suffix, entry in sorted(spec.items(),
+                                          key=lambda kv: kv[1].get("ir_index", 99)):
+                f = entry.get("ir_file")
+                available = (
+                    bool(f) and irs_root is not None
+                    and (irs_root / f).exists()
+                )
+                out.append({
+                    "suffix": suffix,
+                    "ir_index": entry.get("ir_index"),
+                    "ir_file": f,
+                    "label": entry.get("label") or suffix,
+                    "mic_type": entry.get("mic_type"),
+                    "position": entry.get("position"),
+                    "available": available,
+                })
+            return out
+
         cats: dict[str, list] = {}
         for gear, b in best.items():
             info = rs_map.get(gear) or {}
@@ -5420,6 +6074,7 @@ def setup(app, context):
             t3kid = b["tone3000_id"]
             meta = img_idx.get(t3kid) if t3kid else None
             variants = _variants_for(gear, info) if category == "amp" else []
+            mic_variants = _mic_variants_for(gear) if category == "cab" else []
             cats.setdefault(category, []).append({
                 "rs_gear": gear,
                 "real_name": info.get("name") or gear,
@@ -5444,6 +6099,11 @@ def setup(app, context):
                 # Per-variant audition buttons in the Gear card. Empty
                 # list when the amp has no `gain_variants` curation.
                 "variants": variants,
+                # Per-mic-position audition buttons for cabs (similar
+                # shape: {label, ir_file, available}). Empty for non-cab
+                # categories and for cabs without an entry in
+                # rs_cab_mic_map.json (e.g. the user hasn't re-extracted).
+                "mic_variants": mic_variants,
             })
         for lst in cats.values():
             # Primary sort: Rocksmith's psarc order (same order as the
@@ -5764,6 +6424,473 @@ def setup(app, context):
         )
         _preload_thread.start()
         return {"started": True, "total": len(jobs)}
+
+    # ── Gear-centric replace + per-song variant override ────────────────
+    # Three endpoints powering the new song/gear editor UX:
+    #   GET  /gears_in_category/{cat}    list candidate replacements
+    #   POST /piece_variant_override     force a variant for one preset
+    #   POST /gear/replace_with          swap one gear's file across all songs
+
+    def _resolve_gear_file(rs_gear: str, level: str | None,
+                            rs_gain: float | None) -> dict | None:
+        """Resolve what to play for `rs_gear` — could be a NAM file,
+        an extracted Rocksmith IR, or a VST plugin path.
+
+        Returns a dict shaped like a preset_piece update payload, or
+        None when nothing's available:
+
+          {
+            "kind": "nam" | "rs_ir" | "vst",
+            "file": "<subdir>/<name>" | "rocksmith/<name>" | None,
+            "tone3000_id": int | None,
+            "vst_path": "<abs path>" | None,
+            "vst_format": "VST3" | "AU" | None,
+            "vst_state": "<base64 blob>" | None,
+          }
+
+        Cab branch picks the IR by `level` (a mic-position suffix like
+        `5c` / `cc`) when supplied, else the first available IR from the
+        mic map, else the first available IR from rs_cab_to_ir.
+
+        Amp / pedal / rack branch tries: gain_variants first (amps),
+        then the most-used NAM/VST already assigned to this gear in
+        preset_pieces (the library's choice), then default_captures.
+        """
+        if _config_dir is None:
+            return None
+        rs_map = _load_rs_to_real() or {}
+        info = rs_map.get(rs_gear) or {}
+        category = (info.get("category") or "").lower()
+
+        # ── Cab branch: IRs, not NAMs ──────────────────────────────
+        if category == "cab" or rs_gear.lower().startswith(("cab_", "bass_cab_")):
+            irs_root = _config_dir / "nam_irs"
+            mic_map = _load_rs_cab_mic_map().get(rs_gear) or {}
+            chosen_file: str | None = None
+            # 1. If the caller asked for a specific mic-position level, use it.
+            if level and level != "auto" and level in mic_map:
+                cand = (mic_map[level] or {}).get("ir_file")
+                if cand and (irs_root / cand).exists():
+                    chosen_file = cand
+            # 2. Default mic: prefer "Dynamic Cone" (5c), then any close-mic
+            #    variant, then the first available — keeps the swap experience
+            #    consistent ("similar mic, different cab").
+            if chosen_file is None:
+                preferred_order = ["5c", "cc", "tc", "rc", "5e", "ce", "te"]
+                for k in preferred_order + sorted(mic_map):
+                    cand = (mic_map.get(k) or {}).get("ir_file")
+                    if cand and (irs_root / cand).exists():
+                        chosen_file = cand
+                        break
+            # 3. Fallback to the legacy rs_cab_to_ir list (no labels).
+            if chosen_file is None:
+                rs_entry = _load_rs_cab_to_ir().get(rs_gear) or {}
+                for cand in rs_entry.get("irs") or []:
+                    if (irs_root / cand).exists():
+                        chosen_file = cand
+                        break
+            if chosen_file:
+                return {"kind": "rs_ir", "file": chosen_file,
+                        "tone3000_id": None,
+                        "vst_path": None, "vst_format": None, "vst_state": None}
+            return None
+
+        # ── Amp / pedal / rack branch: NAMs ────────────────────────
+        # Step 1 — curated gain_variants (amps with clean/crunch/dist
+        # captures). Pedals/racks don't usually have these.
+        variants = info.get("gain_variants") or {}
+        spec = None
+        if level and level != "auto" and variants:
+            spec = variants.get(level)
+        if spec is None and variants:
+            # Auto-pick by rs_gain (or 50.0 fallback in the helper).
+            spec = _pick_amp_gain_variant(info, rs_gain if rs_gain is not None else 50.0)
+        if spec and isinstance(spec, dict):
+            subdir = _category_subdir_for_gear(rs_gear)
+            amp_dir = _config_dir / "nam_models" / subdir
+            title = (spec.get("notes") or "").strip()
+            tone3000_id = spec.get("tone3000_id")
+            model_id = spec.get("model_id")
+            if title:
+                cand = amp_dir / f"{_safe_filename_human(title)}.nam"
+                if cand.exists():
+                    return {"kind": "nam",
+                            "file": f"{subdir}/{cand.name}",
+                            "tone3000_id": tone3000_id,
+                            "vst_path": None, "vst_format": None,
+                            "vst_state": None}
+            if model_id and tone3000_id:
+                legacy = (f"tone3000_{tone3000_id}_m{model_id}_"
+                          f"{_safe_filename(rs_gear)}.nam")
+                if (amp_dir / legacy).exists():
+                    return {"kind": "nam",
+                            "file": f"{subdir}/{legacy}",
+                            "tone3000_id": tone3000_id,
+                            "vst_path": None, "vst_format": None,
+                            "vst_state": None}
+            # Variant resolved but file is missing — keep tone3000_id
+            # around for the response, fall through to general lookup.
+            fallback_tid = tone3000_id
+        else:
+            fallback_tid = None
+
+        # Step 2 — most-used existing assignment for this rs_gear in
+        # preset_pieces. Covers two cases the picker would otherwise
+        # refuse:
+        #   (a) Pedals/racks that ship without gain_variants but DO
+        #       have a NAM file the auto-download chose.
+        #   (b) Gears the user has assigned a VST plugin to (kind='vst'
+        #       + vst_path), which is the common case for pedals
+        #       (Kilohearts, Valhalla, etc.). When the most-used row
+        #       is a VST we return that VST instead.
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT kind, file, vst_path, vst_format, vst_state, "
+            "       tone3000_id, COUNT(*) "
+            "FROM preset_pieces "
+            "WHERE rs_gear_type = ? "
+            "  AND ((kind = 'nam' AND file IS NOT NULL AND file != '') "
+            "       OR (kind = 'vst' AND vst_path IS NOT NULL AND vst_path != '')) "
+            "GROUP BY kind, file, vst_path "
+            "ORDER BY COUNT(*) DESC LIMIT 1",
+            (rs_gear,),
+        ).fetchone()
+        if row:
+            kind, file_v, vst_path, vst_format, vst_state, tid, _n = row
+            if kind == "vst" and vst_path:
+                # Verify the VST bundle is still on disk.
+                if Path(vst_path).exists():
+                    return {"kind": "vst",
+                            "file": None,
+                            "tone3000_id": None,
+                            "vst_path": vst_path,
+                            "vst_format": vst_format or "VST3",
+                            "vst_state": vst_state}
+            elif kind == "nam" and file_v:
+                cand_path = _safe_child(_config_dir / "nam_models", file_v)
+                if cand_path and cand_path.exists():
+                    return {"kind": "nam",
+                            "file": file_v,
+                            "tone3000_id": tid or fallback_tid,
+                            "vst_path": None, "vst_format": None,
+                            "vst_state": None}
+
+        # Step 3 — default_captures.json pinned tone3000_id + an
+        # existing download with that id. Last-ditch for gears whose
+        # NAM hasn't been used in any preset_piece yet (could happen
+        # right after the user added a song that introduced this gear).
+        dflt = (_load_default_captures().get(rs_gear) or {})
+        dflt_tid = dflt.get("tone3000_id")
+        if dflt_tid:
+            row = conn.execute(
+                "SELECT file FROM preset_pieces "
+                "WHERE tone3000_id = ? AND file IS NOT NULL AND file != '' "
+                "ORDER BY id DESC LIMIT 1",
+                (int(dflt_tid),),
+            ).fetchone()
+            if row and row[0]:
+                cand_path = _safe_child(_config_dir / "nam_models", row[0])
+                if cand_path and cand_path.exists():
+                    return {"kind": "nam",
+                            "file": row[0],
+                            "tone3000_id": dflt_tid,
+                            "vst_path": None, "vst_format": None,
+                            "vst_state": None}
+
+        return None
+
+    @app.get("/api/plugins/rig_builder/gears_in_category/{category}")
+    def gears_in_category(category: str):
+        """List curated gears in `category` (amp/pedal/rack/cab) along
+        with whatever's already assigned, so the front-end can render a
+        gear-centric replacement picker — instead of dumping every NAM
+        file in the bucket, the user sees one card per amp/pedal with
+        its photo + variant count.
+
+        Used by the new "Replace amp with…" / "Replace pedal with…"
+        modal in the Gear and Song views. Sorted by rs_order so the
+        picker mirrors the in-game tone designer's order.
+        """
+        rs_map = _load_rs_to_real() or {}
+        img_idx = _tone_image_index() if category == "amp" else {}
+        out = []
+        is_cab = category.lower() == "cab"
+        # Cabs in rs_to_real.json are stored per mic-position (e.g.
+        # `Bass_Cab_AT1150BC_5c`, `_5e`, `_co`, … — 147 entries). The
+        # picker should show ONE entry per base cab, so collapse the
+        # suffix and dedupe; pick the entry with the most curated info
+        # as the representative. Mic-position picking happens elsewhere
+        # (rs_cab_mic_map / per-song picker).
+        mic_suffix_re = re.compile(r"_(?:[0-9]?[a-z]{1,2})$")
+        seen_bases: set[str] = set()
+        for k, info in rs_map.items():
+            if not isinstance(info, dict):
+                continue
+            cat = (info.get("category") or "").lower()
+            if cat != category.lower():
+                continue
+            if is_cab:
+                base = mic_suffix_re.sub("", k)
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                display_key = base
+            else:
+                display_key = k
+            variants = info.get("gain_variants") or {}
+            # Photo: pick the first variant's tone3000_id and look up the
+            # cached image. For non-variant gears (most cabs/pedals)
+            # there's no photo — UI shows a placeholder.
+            t3kid = None
+            for spec in variants.values():
+                if isinstance(spec, dict) and spec.get("tone3000_id"):
+                    t3kid = spec["tone3000_id"]
+                    break
+            meta = img_idx.get(t3kid) if t3kid else None
+            # Cab variant count comes from rs_cab_mic_map (mic positions),
+            # not from gain_variants.
+            if is_cab:
+                mic_count = len(_load_rs_cab_mic_map().get(display_key) or {})
+                variant_count = mic_count
+                variant_levels = list(
+                    (_load_rs_cab_mic_map().get(display_key) or {}).keys())
+            else:
+                variant_count = len(variants)
+                variant_levels = list(variants.keys())
+            out.append({
+                "rs_gear": display_key,
+                "name": info.get("name") or display_key,
+                "make": info.get("make", ""),
+                "model": info.get("model", ""),
+                "variant_count": variant_count,
+                "variant_levels": variant_levels,
+                "rs_order": info.get("rs_order"),
+                "image": (meta or {}).get("image"),
+            })
+        out.sort(key=lambda g: (g["rs_order"] if g["rs_order"] is not None else 10**9,
+                                 (g["name"] or "").lower()))
+        return {"category": category, "gears": out}
+
+    @app.get("/api/plugins/rig_builder/gear_photo/{rs_gear}")
+    def gear_photo(rs_gear: str):
+        """Serve the Rocksmith-extracted photo for `rs_gear` (PNG).
+
+        Photos come from extract_gear_photos.py — the user runs that
+        once with their gears.psarc to populate amp_photos/, pedal_photos/,
+        rack_photos/, cab_photos/. The redesigned Songs editor uses
+        these for the per-piece thumbnail.
+
+        Returns 404 when no photo exists for this gear; the UI falls
+        back to a "no photo" placeholder. Strong-caches via ETag because
+        these files never change once extracted — the browser keeps the
+        thumbnails warm across full chain re-renders.
+        """
+        path = _find_gear_photo(rs_gear)
+        if path is None:
+            # Don't let browsers cache the 404 — earlier lookup misses
+            # (e.g. branded cabs before the case-insensitive fix) would
+            # stick around forever and keep showing the placeholder
+            # even after we patched the backend. `no-store` forces a
+            # fresh hit every time the user opens the catalog/editor.
+            return JSONResponse(
+                {"error": "no photo"}, 404,
+                headers={"Cache-Control": "no-store"})
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            return JSONResponse({"error": str(e)}, 500)
+        # Cheap ETag — mtime + size. The file is immutable once written,
+        # so this lets the browser 304 every refresh.
+        try:
+            st = path.stat()
+            etag = f'W/"{int(st.st_mtime)}-{st.st_size}"'
+        except OSError:
+            etag = None
+        headers = {"Cache-Control": "public, max-age=86400"}
+        if etag:
+            headers["ETag"] = etag
+        return Response(content=data, media_type="image/png", headers=headers)
+
+    @app.post("/api/plugins/rig_builder/piece_variant_override")
+    def piece_variant_override(data: dict = Body(...)):
+        """Force a specific variant on ONE preset's gear piece.
+
+        Body:
+          - `preset_id`: int
+          - `rs_gear`:   the gear's rs_gear_type
+          - `variant`:   "auto" to clear the override, or a level name
+                         ("clean"/"crunch"/"dist"/etc.)
+
+        Updates the matching preset_pieces row's file + assigned_mode.
+        Setting variant="auto" returns to the gain-driven pick (mode
+        flips back to "auto"). Any other value pins manually (mode
+        "manual" — survives Remap all).
+        """
+        try:
+            preset_id = int(data["preset_id"])
+            rs_gear = str(data["rs_gear"])
+            level = str(data.get("variant") or "auto").lower().strip()
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse({"error": "preset_id, rs_gear, variant required"}, 400)
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT params_json FROM preset_pieces "
+            "WHERE preset_id = ? AND rs_gear_type = ? LIMIT 1",
+            (preset_id, rs_gear),
+        ).fetchone()
+        if not row:
+            return JSONResponse({"error": "no matching piece"}, 404)
+        # Pull the row's Gain knob value so "auto" can use it for picking,
+        # and so explicit levels still record a sensible tone3000_id.
+        try:
+            knobs = json.loads(row[0] or "{}") or {}
+        except (ValueError, TypeError):
+            knobs = {}
+        rs_gain = knobs.get("Gain")
+        try:
+            rs_gain = float(rs_gain) if rs_gain is not None else None
+        except (ValueError, TypeError):
+            rs_gain = None
+        res = _resolve_gear_file(
+            rs_gear, None if level == "auto" else level, rs_gain)
+        if res is None or (not res.get("file") and not res.get("vst_path")):
+            return JSONResponse({"error": f"variant '{level}' has no file on disk for {rs_gear}"}, 404)
+        mode = "auto" if level == "auto" else "manual"
+        with _lock:
+            if res["kind"] == "vst":
+                conn.execute(
+                    "UPDATE preset_pieces "
+                    "SET kind = 'vst', file = NULL, tone3000_id = NULL, "
+                    "    vst_path = ?, vst_format = ?, vst_state = ?, "
+                    "    assigned_mode = ? "
+                    "WHERE preset_id = ? AND rs_gear_type = ?",
+                    (res["vst_path"], res.get("vst_format") or "VST3",
+                     res.get("vst_state"), mode, preset_id, rs_gear),
+                )
+            else:
+                conn.execute(
+                    "UPDATE preset_pieces "
+                    "SET file = ?, kind = ?, tone3000_id = ?, "
+                    "    vst_path = NULL, vst_format = NULL, vst_state = NULL, "
+                    "    assigned_mode = ? "
+                    "WHERE preset_id = ? AND rs_gear_type = ?",
+                    (res["file"], res["kind"] or "nam",
+                     res.get("tone3000_id"), mode, preset_id, rs_gear),
+                )
+            _recompute_preset_primaries(conn, preset_id)
+            conn.commit()
+        return {"ok": True, **res,
+                "variant": level, "assigned_mode": mode}
+
+    @app.post("/api/plugins/rig_builder/gear/replace_with")
+    def gear_replace_with(data: dict = Body(...)):
+        """Swap one gear's assignment for another.
+
+        Body:
+          - `from_rs_gear`: e.g. "Amp_MarshallJCM800" — the gear whose
+                             rows we're rewriting
+          - `to_rs_gear`:   e.g. "Amp_MarshallPlexi" — the gear whose
+                             curated variants we'll use
+          - `preset_id`:    optional. If given, scope to a single song's
+                             preset. Omit to bulk-swap across every song.
+
+        Effect: every matching preset_pieces row with rs_gear_type=from
+        gets a new file/tone3000_id drawn from to's gain_variants, with
+        the matching variant picked per-row by that row's Gain knob (so
+        songs with high Gain inherit to's dist variant, low Gain →
+        clean, etc.). The row's rs_gear_type stays the same — Rocksmith
+        still identifies the song as using `from` — but it now SOUNDS
+        like `to`. Marked `assigned_mode='manual'` so a Remap all
+        doesn't undo it.
+        """
+        try:
+            from_gear = str(data["from_rs_gear"])
+            to_gear = str(data["to_rs_gear"])
+        except (KeyError, TypeError):
+            return JSONResponse({"error": "from_rs_gear, to_rs_gear required"}, 400)
+        preset_id_filter = data.get("preset_id")
+        try:
+            preset_id_filter = int(preset_id_filter) if preset_id_filter is not None else None
+        except (ValueError, TypeError):
+            preset_id_filter = None
+        if from_gear == to_gear:
+            return {"ok": True, "noop": True}
+        # We used to pre-validate that the target gear had `gain_variants`
+        # (for amps) or extracted IRs (for cabs) before walking rows.
+        # That blocked pedals/racks (which never have gain_variants) and
+        # cabs whose base form isn't a literal key in rs_to_real.json.
+        # Instead, let _resolve_gear_file do the talking: when it can't
+        # find ANY file for `to_gear` we count those rows as skipped
+        # and report 0 updates back to the UI.
+        conn = _get_conn()
+        # Walk every row of the source gear, resolve the replacement's
+        # variant for each row's Gain, then update.
+        if preset_id_filter is not None:
+            rows = conn.execute(
+                "SELECT id, preset_id, params_json FROM preset_pieces "
+                "WHERE rs_gear_type = ? AND preset_id = ?",
+                (from_gear, preset_id_filter),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, preset_id, params_json FROM preset_pieces "
+                "WHERE rs_gear_type = ?",
+                (from_gear,),
+            ).fetchall()
+        updated = 0
+        skipped = 0
+        affected_presets = set()
+        with _lock:
+            for pid_row, preset_id, params_json in rows:
+                try:
+                    knobs = json.loads(params_json or "{}") or {}
+                except (ValueError, TypeError):
+                    knobs = {}
+                rs_gain = knobs.get("Gain")
+                try:
+                    rs_gain = float(rs_gain) if rs_gain is not None else None
+                except (ValueError, TypeError):
+                    rs_gain = None
+                res = _resolve_gear_file(to_gear, None, rs_gain)
+                if res is None or (not res.get("file") and not res.get("vst_path")):
+                    skipped += 1
+                    continue
+                # Promote rs_gear_type to the TARGET gear too — the
+                # chain card now shows the new gear's name + photo +
+                # variants. The link to the PSARC tone is via
+                # tone_mappings (filename + tone_key + preset_id),
+                # NOT rs_gear_type, so nothing else breaks.
+                if res["kind"] == "vst":
+                    conn.execute(
+                        "UPDATE preset_pieces "
+                        "SET rs_gear_type = ?, kind = 'vst', "
+                        "    file = NULL, tone3000_id = NULL, "
+                        "    vst_path = ?, vst_format = ?, vst_state = ?, "
+                        "    assigned_mode = 'manual' "
+                        "WHERE id = ?",
+                        (to_gear, res["vst_path"],
+                         res.get("vst_format") or "VST3",
+                         res.get("vst_state"), pid_row),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE preset_pieces "
+                        "SET rs_gear_type = ?, file = ?, kind = ?, "
+                        "    tone3000_id = ?, "
+                        "    vst_path = NULL, vst_format = NULL, vst_state = NULL, "
+                        "    assigned_mode = 'manual' "
+                        "WHERE id = ?",
+                        (to_gear, res["file"], res["kind"] or "nam",
+                         res.get("tone3000_id"), pid_row),
+                    )
+                updated += 1
+                affected_presets.add(preset_id)
+            for pid in affected_presets:
+                _recompute_preset_primaries(conn, pid)
+            conn.commit()
+        return {"ok": True, "from": from_gear, "to": to_gear,
+                "pieces_updated": updated, "skipped": skipped,
+                "presets_affected": len(affected_presets)}
 
     @app.post("/api/plugins/rig_builder/nam_purge")
     def purge_nam(data: dict = Body(...)):

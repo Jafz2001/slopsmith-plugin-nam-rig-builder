@@ -383,6 +383,40 @@ def main():
         )
         sys.exit(3)
     out_path = Path(__file__).parent / "rs_to_real.json"
+    # Preserve curator-only fields when overwriting an existing file.
+    # The PSARC walk reproduces everything we derive from the archive
+    # (manifest, make/model, name, category, sound_bank, tone3000_query,
+    # rs_order, etc.) — but `gain_variants` and any per-gear curator
+    # overrides ARE NOT in the PSARC, only in the JSON the curator
+    # built by hand. A naive overwrite wipes them. Merge instead:
+    # keep new PSARC-derived data, but graft the curator's fields back
+    # onto each entry.
+    CURATOR_FIELDS = (
+        "gain_variants",
+        "gain_proxy_knobs",        # Plexi-style Loudness1/Loudness2
+        "tone3000_id",             # explicit pinned default capture
+        "model_id",                # explicit model_id pin
+        "curator",                 # who picked these
+        "name_correction_note",    # user-noted disagreement w/ auto-name
+        "query_source",            # whether the query was overridden
+    )
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+        except (ValueError, OSError):
+            existing = {}
+        merged_count = 0
+        for rs_gear, new_entry in mapping.items():
+            old_entry = existing.get(rs_gear) or {}
+            if not isinstance(old_entry, dict):
+                continue
+            for field in CURATOR_FIELDS:
+                if field in old_entry and field not in new_entry:
+                    new_entry[field] = old_entry[field]
+                    merged_count += 1
+        if merged_count:
+            print(f"Preserved {merged_count} curator-only field(s) "
+                  f"from existing rs_to_real.json")
     out_path.write_text(json.dumps(mapping, indent=2, sort_keys=True))
 
     by_cat: dict[str, int] = {}
