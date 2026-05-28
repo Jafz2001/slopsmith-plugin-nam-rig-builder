@@ -5308,7 +5308,31 @@ async function rbAfterGearChange(toneIdx) {
 // ── Single-stage audition (catalog ▶ and search-candidate ▶) ──────────
 // Loads ONE NAM/IR stage into the engine so you hear that gear in
 // isolation. `btnId` is the toggling button; calling again stops it.
-async function rbAuditionFile(file, kind, btnId) {
+// Perceptual-loudness trim for amp gain-variant auditioning. LUFS
+// normalization in the backend matches integrated loudness across NAMs,
+// but distortion captures still SOUND louder than equally-LUFS-matched
+// clean captures because of sustained harmonic density. Compensate by
+// attenuating progressively for higher-gain variants. Tuned by ear
+// against typical curated 3-tier amps (Marshall JCM800, Twin, etc.).
+// Returns 1.0 (no extra trim) for unknown levels so non-variant amps
+// audition exactly as before.
+function rbAuditionGainForVariantLevel(level) {
+    const TRIM_DB = {
+        clean:    0,
+        crunch:  -3,
+        dist:    -6,
+        // Common alternate level names — keep parity if curators use them.
+        lead:    -6,
+        od:      -3,
+        ultra:   -6,
+        ultraod1:-6,
+    };
+    const dB = TRIM_DB[(level || '').toLowerCase()];
+    if (dB == null) return 1.0;
+    return Math.pow(10, dB / 20);
+}
+
+async function rbAuditionFile(file, kind, btnId, gain) {
     const btn = btnId ? document.getElementById(btnId) : null;
     if (rbState._auditionId === btnId) { await rbStopPreview(); return; }
     await rbStopPreview();   // stop any other preview/audition first
@@ -5321,7 +5345,9 @@ async function rbAuditionFile(file, kind, btnId) {
     if (btn && !btn.dataset.origLabel) btn.dataset.origLabel = btn.textContent;
     if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
     try {
-        const url = `${RB_API}/native_preset_one?file=${encodeURIComponent(file)}&kind=${encodeURIComponent(kind || 'nam')}`;
+        const gainQs = (typeof gain === 'number' && isFinite(gain))
+            ? `&gain=${encodeURIComponent(gain.toFixed(4))}` : '';
+        const url = `${RB_API}/native_preset_one?file=${encodeURIComponent(file)}&kind=${encodeURIComponent(kind || 'nam')}${gainQs}`;
         const payload = await (await fetch(url)).json();
         const chain = payload.native_preset && payload.native_preset.chain;
         if (!Array.isArray(chain) || !chain.length) throw new Error('file not found');
@@ -5698,8 +5724,13 @@ function rbRenderCatalogCard(g) {
                 return `<button disabled title="NAM not downloaded — Setup → Download all curated variants"
                                 class="text-[10px] px-2 py-0.5 rounded bg-dark-800/50 text-gray-600 cursor-not-allowed">▶ ${rbEsc(v.level)}</button>`;
             }
-            return `<button id="${vId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}')"
-                            title="${rbEsc(v.notes || v.level)}"
+            // Per-level perceptual trim: clean=1.0, crunch=0.71 (-3 dB),
+            // dist=0.50 (-6 dB). Layers on top of the backend's LUFS
+            // normalization to compensate for the harmonic-density boost
+            // distortion captures get beyond integrated loudness.
+            const trim = rbAuditionGainForVariantLevel(v.level);
+            return `<button id="${vId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}',${trim})"
+                            title="${rbEsc(v.notes || v.level)} — A/B level-matched (${(20 * Math.log10(trim)).toFixed(0)} dB trim)"
                             class="text-[10px] px-2 py-0.5 rounded bg-emerald-900/30 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/40">▶ ${rbEsc(v.level)}</button>`;
         }).join(' ');
         variantAuditionRow = `<div class="flex items-center gap-1 flex-wrap">
