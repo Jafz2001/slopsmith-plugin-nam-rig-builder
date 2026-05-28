@@ -1,30 +1,39 @@
 {
   "_meta": {
     "description": "Seed catalog: Rocksmith gear type → recommended VST3/AU plugins. Free plugins only. Used by /vst/suggest endpoint and the per-piece VST panel hint.",
-    "version": 4,
+    "version": 5,
     "updated": "2026-05-28",
-    "notes": "v4: add Voxengo Marvel GEQ as a third install — fills the only fidelity gap KHS Essentials has (graphic-style 5/8-band EQ). v3: standardise on Kilohearts Essentials. ONE free installer gives 30+ modular FX plug-ins with consistent param naming — way cleaner than the patchwork of vendor-specific frees. Tremolo is the only category where KHS doesn't ship a dedicated module; we keep Bertom FreeTremolo for that."
+    "notes": "v5: add MeldaProduction Free as a second core install — drops Bertom (MTremolo+MVibrato replace it) and upgrades multi-band EQ from 3 → 6 bands (MEqualizer beats kHs 3-Band for the EQ5/EQ8/StudioEQ family). Melda free covers tremolo/vibrato/flanger/phaser/ring-mod/EQ/comp as PRIMARY. KHS stays primary for chorus/limiter/gate/multi-band-comp/wah-filter (Melda's free bundle has no equivalent — its *MB, Turbo*, Vintage* etc. are paid demo and mute periodically). Marvel GEQ is an OPTIONAL third install for users who want true 16-band EQ on EQ5/EQ8."
   },
 
   "__free_vst_install_guide": {
-    "_note": "Three free installs cover the entire library.",
+    "_note": "Two free installs cover the whole library. Optional third for max EQ fidelity.",
     "essential": [
       {
         "name": "Kilohearts Essentials",
-        "covers": "Chorus, Flanger, Phaser, Delay, Reverb, Filter/Wah, Compressor, Limiter, Gate, 3-Band EQ, Distortion/Drive, Bitcrusher, Pitch Shifter (octavers!), Ring Mod — every category except Tremolo and multi-band EQ",
+        "covers": "Chorus, Delay, Reverb, Filter/Wah, Limiter, Gate, 3-Band EQ (fallback), Distortion/Drive, Bitcrusher, Pitch Shifter (octavers), Ring Mod (fallback)",
         "url": "https://kilohearts.com/products/essentials",
-        "install_notes": "Run the installer once. Each module ships as an individual VST3 (kHs Chorus.vst3, kHs Delay.vst3, etc.) in /Library/Audio/Plug-Ins/VST3 on macOS. After install, run Settings → Scan for plugins."
+        "install_notes": "Each module ships as an individual VST3 (kHs Chorus.vst3, kHs Delay.vst3, etc.) in /Library/Audio/Plug-Ins/VST3 on macOS. After install, Settings → Scan plugins."
       },
       {
-        "name": "Bertom FreeTremolo",
-        "covers": "Tremolo, AmpTrem, MultiTrem, AmpVibe, MultiVibe (KHS has no dedicated tremolo)",
-        "url": "https://www.bertomaudio.com/freetremolo.html"
-      },
+        "name": "MeldaProduction Free (MFreeFXBundle)",
+        "covers": "Tremolo (MTremolo), Vibrato (MVibrato), Flanger (MFlanger), Phaser (MPhaser), Ring Mod (MRingModulator), 6-band EQ (MEqualizer), Compressor (MCompressor)",
+        "url": "https://www.meldaproduction.com/MFreeFXBundle",
+        "install_notes": "Install the FREE-ONLY bundle, not MCompleteBundle. Premium plugins (anything with *MB / Turbo* / Vintage* / MGuitarArchitect / MLimiterX etc.) run in demo mode with PERIODIC AUDIO MUTING — unusable for song playback. The catalog only ever points to verified-free plugins."
+      }
+    ],
+    "optional_for_eq_fidelity": [
       {
         "name": "Voxengo Marvel GEQ",
-        "covers": "Pedal_EQ5 + Pedal_EQ8 (RS graphic-EQ pedals). 16-band linear-phase graphic EQ — absorbs the 5/8 RS bands cleanly. kHs 3-Band EQ is the lossy fallback if you don't want a third install.",
+        "covers": "Pedal_EQ5 + Pedal_EQ8 + Bass_Pedal_BassEQ8 — 16-band linear-phase graphic EQ. Lossless mapping vs MEqualizer's 6-band (which loses 2 of 8 for EQ8).",
         "url": "https://www.voxengo.com/product/marvelgeq/",
-        "install_notes": "Free download, no registration required. VST3 + AU on macOS/Windows."
+        "install_notes": "Free, no registration. VST3 + AU on macOS/Windows."
+      },
+      {
+        "name": "TDR Nova",
+        "covers": "Rack_StudioEQ (4-band parametric, 154 songs in the test library). MEqualizer also fits — Nova is just a cleaner musical match.",
+        "url": "https://www.tokyodawn.net/tdr-nova/",
+        "install_notes": "Free, no registration. VST3 + AU."
       }
     ]
   },
@@ -49,54 +58,70 @@
   ],
 
   "Pedal_Flanger": [
-    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Rate, Depth, Feedback, Dry/Wet"}
+    {"name": "MFlanger",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Rate, Depth, Feedback, Dry/Wet — Melda free"},
+    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_80sFlanger": [
-    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Higher feedback for jet sweep"}
+    {"name": "MFlanger",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Higher feedback for jet sweep"},
+    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_ClassicFlanger": [
-    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Default settings"}
+    {"name": "MFlanger",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Default settings"},
+    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_ModernFlanger": [
-    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Stereo width + high feedback"}
+    {"name": "MFlanger",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Stereo width + high feedback"},
+    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_VintageFlanger": [
-    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "MXR-style — lower rate"}
+    {"name": "MFlanger",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "MXR-style — lower rate"},
+    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Bass_Pedal_BassFlanger": [
-    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Slow rate, low feedback"}
+    {"name": "MFlanger",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Slow rate, low feedback"},
+    {"name": "kHs Flanger",         "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
 
   "Pedal_Phaser": [
-    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Rate, Depth, Feedback, Stages, Dry/Wet"}
+    {"name": "MPhaser",             "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Rate, Depth, Feedback, Stages, Dry/Wet — Melda free"},
+    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_ShaverPhaser": [
-    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Two-stage phaser sound"}
+    {"name": "MPhaser",             "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Two-stage phaser sound"},
+    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_PlanePhase": [
-    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Higher Stages + Feedback for jet"}
+    {"name": "MPhaser",             "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Higher Stages + Feedback for jet"},
+    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Bass_Pedal_BassPhase": [
-    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Slow rate"}
+    {"name": "MPhaser",             "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Slow rate"},
+    {"name": "kHs Phaser",          "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
 
   "Pedal_Tremolo": [
-    {"name": "Bertom FreeTremolo",  "manufacturer": "Bertom Audio","format": "VST3", "url": "https://www.bertomaudio.com/freetremolo.html", "free": true, "notes": "KHS doesn't ship a tremolo — Bertom fills that gap"}
+    {"name": "MTremolo",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Rate, Depth, Dry/Wet — Melda free, multi-shape"}
   ],
   "Pedal_AmpTrem": [
-    {"name": "Bertom FreeTremolo",  "manufacturer": "Bertom Audio","format": "VST3", "url": "https://www.bertomaudio.com/freetremolo.html", "free": true, "notes": "Sine mode = vintage Fender amp tremolo"}
+    {"name": "MTremolo",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Sine shape = vintage Fender amp tremolo"}
   ],
   "Pedal_MultiTrem": [
-    {"name": "Bertom FreeTremolo",  "manufacturer": "Bertom Audio","format": "VST3", "url": "https://www.bertomaudio.com/freetremolo.html", "free": true, "notes": "Switch shapes for variety"}
+    {"name": "MTremolo",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Switch shapes for variety"}
+  ],
+  "Pedal_TremOle": [
+    {"name": "MTremolo",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Square/triangle shape for hard chop"}
   ],
   "Pedal_AmpVibe": [
-    {"name": "Bertom FreeTremolo",  "manufacturer": "Bertom Audio","format": "VST3", "url": "https://www.bertomaudio.com/freetremolo.html", "free": true, "notes": "Fast rate for vibrato approximation"}
+    {"name": "MVibrato",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Rate, Depth, Dry/Wet — true vibrato (pitch-mod) not trem"}
   ],
   "Pedal_MultiVibe": [
-    {"name": "Bertom FreeTremolo",  "manufacturer": "Bertom Audio","format": "VST3", "url": "https://www.bertomaudio.com/freetremolo.html", "free": true, "notes": "Univibe-ish with sine + medium rate"}
+    {"name": "MVibrato",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Univibe-ish with medium rate"}
+  ],
+  "Pedal_AutoVibe": [
+    {"name": "MVibrato",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Auto-vibrato — set fixed rate/depth (no envelope)"}
   ],
   "Pedal_MarshallSupervibe": [
-    {"name": "Bertom FreeTremolo",  "manufacturer": "Bertom Audio","format": "VST3", "url": "https://www.bertomaudio.com/freetremolo.html", "free": true, "notes": "Slow rate for Leslie-ish vibe"}
+    {"name": "MVibrato",            "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Slow rate for Leslie-ish vibe"}
   ],
   "Pedal_BakedRotatoe": [
     {"name": "kHs Chorus",          "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Rotary speaker → wide stereo chorus approximation"}
@@ -144,37 +169,46 @@
   ],
 
   "Pedal_Compression": [
-    {"name": "kHs Compressor",      "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Threshold, Ratio, Attack, Release, Knee, Makeup, Mix"}
+    {"name": "MCompressor",         "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Threshold, Ratio, Attack, Release, Knee, Output Gain, Dry/Wet — Melda free"},
+    {"name": "kHs Compressor",      "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Pedal_Compressor": [
-    {"name": "kHs Compressor",      "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Full-featured single-band comp"}
+    {"name": "MCompressor",         "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Full-featured single-band comp — Melda free"},
+    {"name": "kHs Compressor",      "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
   "Bass_Pedal_MBComp": [
-    {"name": "kHs Compressor",      "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Limit: KHS only ships single-band; full multiband would need paid Multipass"}
+    {"name": "MCompressor",         "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Single-band fallback — Melda free MDynamicsMB doesn't exist in the free bundle; true multiband needs paid MDynamicsMB"},
+    {"name": "kHs Compressor",      "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Also single-band"}
   ],
 
   "Pedal_EQ5": [
-    {"name": "Voxengo Marvel GEQ",  "manufacturer": "Voxengo",     "format": "VST3", "url": "https://www.voxengo.com/product/marvelgeq/", "free": true, "notes": "16-band linear-phase graphic EQ — RS EQ5's 5 bands map 1:1 onto 5 of the 16 Marvel bands (curator picks which 5 based on RS knob frequencies)"},
-    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy fallback: KHS Essentials only ships a 3-band EQ. 3 of 5 RS bands mapped, others dropped. Install Marvel GEQ for full fidelity."}
+    {"name": "MEqualizer",          "manufacturer": "MeldaProduction",    "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "6-band parametric (Melda free). Fits all 5 RS bands losslessly — curator sets Band 1-5 Frequency to RS freqs (63/250/750/2200/5700 Hz)"},
+    {"name": "Voxengo Marvel GEQ",  "manufacturer": "Voxengo",            "format": "VST3", "url": "https://www.voxengo.com/product/marvelgeq/", "free": true, "notes": "16-band linear-phase upgrade — also lossless"},
+    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 5→3 fallback"}
   ],
   "Pedal_EQ8": [
-    {"name": "Voxengo Marvel GEQ",  "manufacturer": "Voxengo",     "format": "VST3", "url": "https://www.voxengo.com/product/marvelgeq/", "free": true, "notes": "16-band linear-phase graphic EQ — RS EQ8's 8 bands map cleanly onto 8 of the 16 Marvel bands. Best fidelity option."},
-    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy fallback. Install Marvel GEQ for full 8-band fidelity."}
+    {"name": "MEqualizer",          "manufacturer": "MeldaProduction",    "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "6-band parametric — fits 6 of 8 RS bands (loses 2). Better than kHs 3-Band. Install Marvel GEQ if you want all 8."},
+    {"name": "Voxengo Marvel GEQ",  "manufacturer": "Voxengo",            "format": "VST3", "url": "https://www.voxengo.com/product/marvelgeq/", "free": true, "notes": "16-band — full 8/8 fidelity"},
+    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 8→3 fallback"}
   ],
   "Pedal_AmpEQ": [
-    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Bass/Mid/Treble matches amp EQ perfectly — no need for Marvel GEQ here"}
+    {"name": "MEqualizer",          "manufacturer": "MeldaProduction",    "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "3 bands suffice for Bass/Mid/Treble tone stack — use Band 1-3"},
+    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Bass/Mid/Treble fixed crossovers"}
   ],
   "Bass_Pedal_BassEQ8": [
-    {"name": "Voxengo Marvel GEQ",  "manufacturer": "Voxengo",     "format": "VST3", "url": "https://www.voxengo.com/product/marvelgeq/", "free": true, "notes": "Bass-EQ8 — 8 RS bands → 8 of 16 Marvel bands (curator selects which Marvel bands match RS frequencies). kHs 3-Band would lose 5 of 8 bands."},
-    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 8→3 fallback"}
+    {"name": "MEqualizer",          "manufacturer": "MeldaProduction",    "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "6 of 8 RS bands; curator sets Band 1-6 Frequency to RS freqs (e.g. 75/185/460/1100/2700/6800 Hz)"},
+    {"name": "Voxengo Marvel GEQ",  "manufacturer": "Voxengo",            "format": "VST3", "url": "https://www.voxengo.com/product/marvelgeq/", "free": true, "notes": "16-band — full 8/8 fidelity"},
+    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 8→3 fallback"}
   ],
   "Rack_StudioEQ": [
-    {"name": "TDR Nova",            "manufacturer": "Tokyo Dawn Records", "format": "VST3", "url": "https://www.tokyodawn.net/tdr-nova/", "free": true, "notes": "4-band parametric (dynamic) — direct fit for RS Rack_StudioEQ's Bass/LoMid/HiMid/Treble + Q + Freq layout. Free. Most-used EQ in the library (154 songs)."},
-    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 4→3 fallback (gain knobs only; HiMid + Q + Freq are dropped)."}
+    {"name": "MEqualizer",          "manufacturer": "MeldaProduction",    "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "6-band parametric — fits all 4 RS bands with Q + Freq from MEqualizer's own Band N Q / Band N Frequency knobs. Most-used EQ (154 songs)."},
+    {"name": "TDR Nova",            "manufacturer": "Tokyo Dawn Records", "format": "VST3", "url": "https://www.tokyodawn.net/tdr-nova/", "free": true, "notes": "4-band parametric (dynamic) — direct 1:1 fit if you prefer Nova's musical voicing"},
+    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 4→3 fallback (Q + Freq dropped)"}
   ],
   "Rack_StudioGraphicEQ": [
-    {"name": "TDR Nova",            "manufacturer": "Tokyo Dawn Records", "format": "VST3", "url": "https://www.tokyodawn.net/tdr-nova/", "free": true, "notes": "5-band parametric (Bass/LoMid/Mid/HiMid/Treble + Freq). Use TDR Nova's 4 bands; one mid drops."},
-    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 5→3 fallback."}
+    {"name": "MEqualizer",          "manufacturer": "MeldaProduction",    "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "6-band parametric — covers all 5 RS bands"},
+    {"name": "TDR Nova",            "manufacturer": "Tokyo Dawn Records", "format": "VST3", "url": "https://www.tokyodawn.net/tdr-nova/", "free": true, "notes": "4-band parametric (one RS mid drops)"},
+    {"name": "kHs 3-Band EQ",       "manufacturer": "Kilohearts",         "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Lossy 5→3 fallback"}
   ],
 
   "Pedal_NoiseGate": [
@@ -277,7 +311,8 @@
     {"name": "kHs Bitcrush",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Bits + Sample Rate + Mix"}
   ],
   "Pedal_RingMod": [
-    {"name": "kHs Ring Mod",        "manufacturer": "Kilohearts",  "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Frequency + Mix"}
+    {"name": "MRingModulator",      "manufacturer": "MeldaProduction", "format": "VST3", "url": "https://www.meldaproduction.com/MFreeFXBundle", "free": true, "notes": "Frequency, Depth, Dry/Wet — Melda free (yes, the free bundle ships this; *MB variant is the paid one)"},
+    {"name": "kHs Ring Mod",        "manufacturer": "Kilohearts",      "format": "VST3", "url": "https://kilohearts.com/products/essentials", "free": true, "notes": "Fallback"}
   ],
 
   "Pedal_Swole": [
