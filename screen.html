@@ -212,13 +212,12 @@
                 </li>
                 <li>
                     <span class="font-medium">Scan library &amp; auto-assign</span>
-                    — walks every song and assigns captures to each gear.
-                    With <span class="text-emerald-300">🎯 Curated only</span>
-                    enabled, only your curated 1-to-1 mappings get applied;
-                    anything uncurated lands in
+                    — walks every song and assigns captures to each gear from
+                    the curated 1-to-1 mappings (<span class="text-emerald-300">🎯 Curated only</span>
+                    is on by default). Anything not curated lands in
                     <span class="text-amber-300">pending</span> for you to
-                    pick later. Without it, the plugin falls back to
-                    tone3000 fuzzy search for uncurated gears.
+                    pick later. Uncheck the box if you want the legacy
+                    tone3000 fuzzy fallback.
                 </li>
                 <li>
                     <span class="font-medium">Refine in the Gear catalog</span>
@@ -254,15 +253,16 @@
                 unless you turn that step off below.
             </p>
             <label class="flex items-start gap-2 mb-4 text-sm cursor-pointer">
-                <input type="checkbox" id="rb-curated-only"
+                <input type="checkbox" id="rb-curated-only" checked
                        onchange="rbSetCuratedOnly(this.checked)"
                        class="mt-1 accent-emerald-500">
                 <span class="text-gray-300">
-                    <span class="font-medium">🎯 Curated only</span>
-                    <span class="text-gray-500"> — skip tone3000 fuzzy search.
+                    <span class="font-medium">🎯 Curated only <span class="text-[10px] text-gray-500">(default)</span></span>
+                    <span class="text-gray-500"> — only use the curated 1-to-1 mappings
+                    in <code class="bg-dark-800 px-1 rounded">rs_to_real.json</code> + <code class="bg-dark-800 px-1 rounded">default_captures.json</code>.
                     Gears without a curated default land in
-                    <span class="text-amber-300">pending</span> for me to pick
-                    later via Gear → 📚 Library / 🎚 Variants.</span>
+                    <span class="text-amber-300">pending</span> instead of triggering a
+                    tone3000 fuzzy search. Uncheck to allow the legacy search-based fallback.</span>
                 </span>
             </label>
             <div class="flex flex-wrap gap-3">

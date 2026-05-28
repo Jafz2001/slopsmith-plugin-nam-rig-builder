@@ -198,10 +198,10 @@ _DEFAULT_SETTINGS = {
     # manual swap propagates across the library. Anything without a
     # curated pick lands in "pending" instead of triggering a tone3000
     # search — the curator picks it later via Gear → 📚 Library or
-    # 🎚 Variants. Default False so existing installs keep the
-    # search-based fallback that bootstrapped them; curators can flip
-    # it on from Setup once their library is fully covered.
-    "curated_only": False,
+    # 🎚 Variants. Default True now that the shipped rs_to_real.json
+    # has full coverage; users who prefer the legacy tone3000 fuzzy
+    # fallback can flip it off from Setup.
+    "curated_only": True,
     # v3 auto-download knobs.
     "preferred_size": "standard",       # standard | lite | feather | nano
     "auto_download": True,              # batch downloads files instead of just recording IDs
