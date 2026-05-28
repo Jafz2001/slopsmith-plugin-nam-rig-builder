@@ -531,7 +531,7 @@
     "manifest": "gear_amp_en30",
     "model": "30",
     "name": "ENGL 30",
-    "name_correction_note": "auto-gen mismapped 'EN' prefix \u2192 ENGL; corrected per name_from_sheet + zoom_notes | user re-curated as Vox AC30 CH (was 'Vox AC-30')",
+    "name_correction_note": "auto-gen mismapped 'EN' prefix → ENGL; corrected per name_from_sheet + zoom_notes | user re-curated as Vox AC30 CH (was 'Vox AC-30')",
     "query_source": "series",
     "sound_bank": "amp_en30",
     "tone3000_gears": "amp",
@@ -1786,7 +1786,7 @@
     "manifest": "gear_amp_tw22",
     "model": "22",
     "name": "Fender Tweed 22",
-    "name_correction_note": "auto-gen mismapped 'TW' prefix \u2192 Tweed; corrected per zoom_notes + alternatives_from_sheet (both call it Twin Reverb)",
+    "name_correction_note": "auto-gen mismapped 'TW' prefix → Tweed; corrected per zoom_notes + alternatives_from_sheet (both call it Twin Reverb)",
     "query_source": "series",
     "sound_bank": "amp_tw22",
     "tone3000_gears": "amp",
@@ -2237,14 +2237,13 @@
     "category": "amp",
     "gain_variants": {
       "clean": {
-        "curator": "Nacho",
-        "model_id": 72425,
-        "notes": "GALLIEN KRUEGER - RB800 - G1.0",
+        "tone3000_id": 2608,
         "rs_gain_range": [
-          0.0,
-          35.0
+          0,
+          35
         ],
-        "tone3000_id": 2694
+        "model_id": 72995,
+        "notes": "GK_800_line_1"
       },
       "crunch": {
         "curator": "Nacho",

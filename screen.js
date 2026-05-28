@@ -124,17 +124,43 @@
 // don't all refetch — the boot-time fetch in rbInit / mega-chain hook
 // populates it. Falls back to 8.0 if the cache hasn't loaded yet.
 //
+// BASS handling: tone3000 bass captures (Gallien-Krueger G1.0/G3.0/G5.0,
+// CS75B, Bassman, etc.) are typically authored at clean gain settings,
+// so the guitar-amp 8× drive over-saturates them — the model is being
+// fed +18 dB beyond its capture-time operating point. For bass songs
+// (4-string arrangement) or auditioning a Bass_* gear, we use unity
+// (1.0) drive instead. Detection sources, in priority:
+//   1. opts.isBass: explicit override (audition path passes this based
+//      on rs_gear, which the gear catalog has on hand)
+//   2. window.highway.getStringCount() <= 4 (song-playback path; the
+//      bundle publishes string count from the song_info payload)
+//   3. fall through to guitar drive
+//
 // The engine resets input gain to 1.0 on every chain reload, so we
 // have to re-apply after each loadPreset. Hooks:
 //   - fetch interceptor (bundle's chain load)
 //   - mega-chain build (initial preload at song start)
 //   - rbListenTone (Listen ▶ in per-song view)
 //   - rbAuditionFile (▶ in Gear catalog)
-function rbApplyChainInputDrive() {
+function rbApplyChainInputDrive(opts) {
     const audio = window.slopsmithDesktop && window.slopsmithDesktop.audio;
     if (!audio || typeof audio.setGain !== 'function') return;
-    const drive = (typeof window.__rbChainInputDrive === 'number' && window.__rbChainInputDrive > 0)
-        ? window.__rbChainInputDrive : 8.0;
+    let isBass = (opts && opts.isBass === true);
+    if (!isBass && !(opts && opts.isBass === false)) {
+        try {
+            const hw = window.highway;
+            const sc = hw && typeof hw.getStringCount === 'function'
+                ? hw.getStringCount() : null;
+            if (typeof sc === 'number' && sc > 0 && sc <= 4) isBass = true;
+        } catch (_) {}
+    }
+    let drive;
+    if (isBass) {
+        drive = 1.0;
+    } else {
+        drive = (typeof window.__rbChainInputDrive === 'number' && window.__rbChainInputDrive > 0)
+            ? window.__rbChainInputDrive : 8.0;
+    }
     return audio.setGain('input', drive).catch((e) => {
         console.warn('[rig_builder] setGain(input,', drive, ') failed:', e);
     });
@@ -5466,7 +5492,7 @@ function rbAuditionGainForVariantLevel(level) {
     return Math.pow(10, dB / 20);
 }
 
-async function rbAuditionFile(file, kind, btnId, gain) {
+async function rbAuditionFile(file, kind, btnId, gain, rsGear) {
     const btn = btnId ? document.getElementById(btnId) : null;
     if (rbState._auditionId === btnId) { await rbStopPreview(); return; }
     await rbStopPreview();   // stop any other preview/audition first
@@ -5481,14 +5507,24 @@ async function rbAuditionFile(file, kind, btnId, gain) {
     try {
         const gainQs = (typeof gain === 'number' && isFinite(gain))
             ? `&gain=${encodeURIComponent(gain.toFixed(4))}` : '';
-        const url = `${RB_API}/native_preset_one?file=${encodeURIComponent(file)}&kind=${encodeURIComponent(kind || 'nam')}${gainQs}`;
+        const gearQs = (typeof rsGear === 'string' && rsGear)
+            ? `&rs_gear=${encodeURIComponent(rsGear)}` : '';
+        const url = `${RB_API}/native_preset_one?file=${encodeURIComponent(file)}&kind=${encodeURIComponent(kind || 'nam')}${gainQs}${gearQs}`;
         const payload = await (await fetch(url)).json();
         const chain = payload.native_preset && payload.native_preset.chain;
         if (!Array.isArray(chain) || !chain.length) throw new Error('file not found');
         if (api.clearChain) await api.clearChain().catch(() => {});
         const res = await api.loadPreset(JSON.stringify(payload.native_preset));
         if (!res || res.success === false) throw new Error((res && res.error) || 'loadPreset failed');
-        if (api.setGain) { await rbApplyChainInputDrive(); await api.setGain('chain', 1.0).catch(() => {}); }
+        if (api.setGain) {
+            // Chain-level drive matched to the audition target. Bass
+            // amps (rs_gear starts with 'Bass_') use unity to avoid
+            // over-saturating the tone3000 clean-gain capture; the
+            // catalog always knows g.rs_gear so this is reliable.
+            const isBass = typeof rsGear === 'string' && rsGear.startsWith('Bass_');
+            await rbApplyChainInputDrive({ isBass });
+            await api.setGain('chain', 1.0).catch(() => {});
+        }
         if (api.setMonitorMute) await api.setMonitorMute(false).catch(() => {});
         const wasRunning = api.isAudioRunning ? await api.isAudioRunning().catch(() => true) : true;
         await api.startAudio();
@@ -5731,7 +5767,7 @@ function rbRenderCatalogCardCompact(g) {
             </div>
             ${file}
         </div>
-        ${g.file ? `<button id="${btnId}" onclick="rbAuditionFile(${JSON.stringify(g.file)},${JSON.stringify(g.kind || 'nam')},'${btnId}')"
+        ${g.file ? `<button id="${btnId}" onclick="rbAuditionFile(${JSON.stringify(g.file)},${JSON.stringify(g.kind || 'nam')},'${btnId}',undefined,${JSON.stringify(g.rs_gear || '')})"
                             class="text-gray-400 hover:text-emerald-300 px-1.5 py-0.5 text-xs">▶</button>` : ''}
     </div>`;
 }
@@ -5827,7 +5863,7 @@ function rbRenderCatalogCard(g) {
                            title="Edit this VST's settings (loads + opens native editor, applies _static defaults)"
                            class="bg-purple-900/40 hover:bg-purple-900/60 text-purple-200 border border-purple-800/50 px-3 py-1.5 rounded text-xs">🎛 Edit</button>`;
     } else if (g.assigned && !hasInlineAudition) {
-        listenBtn = `<button id="${btnId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(g.file).replace(/'/g,"\\'")}', '${rbEsc(g.kind || 'nam')}', '${btnId}')"
+        listenBtn = `<button id="${btnId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(g.file).replace(/'/g,"\\'")}', '${rbEsc(g.kind || 'nam')}', '${btnId}', undefined, '${rbEsc(g.rs_gear || '')}')"
                             title="Listen to this gear in isolation"
                             class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-3 py-1.5 rounded text-xs">▶ Listen</button>`;
     }
@@ -5863,7 +5899,7 @@ function rbRenderCatalogCard(g) {
             // normalization to compensate for the harmonic-density boost
             // distortion captures get beyond integrated loudness.
             const trim = rbAuditionGainForVariantLevel(v.level);
-            return `<button id="${vId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}',${trim})"
+            return `<button id="${vId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}',${trim},'${rbEsc(g.rs_gear || '')}')"
                             title="${rbEsc(v.notes || v.level)} — A/B level-matched (${(20 * Math.log10(trim)).toFixed(0)} dB trim)"
                             class="text-[10px] px-2 py-0.5 rounded bg-emerald-900/30 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/40">▶ ${rbEsc(v.level)}</button>`;
         }).join(' ');

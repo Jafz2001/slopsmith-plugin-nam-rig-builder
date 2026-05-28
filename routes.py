@@ -658,9 +658,17 @@ def _nam_loudness_for_path(path: Path) -> float | None:
     return val
 
 
-def _nam_normalized_output_level(path: Path) -> float:
+def _nam_normalized_output_level(path: Path,
+                                  effective_input_drive: float | None = None) -> float:
     """Compute the `outputLevel` to send to the engine for a NAM stage
     so the captured loudness lands at the configured target.
+
+    `effective_input_drive` lets the caller declare the actual inputLevel
+    they're sending to the stage (e.g. 1.0 for bass amps, 2.5 for guitar
+    amps via `_amp_input_drive_for`). The makeup output level is divided
+    by this so perceived loudness stays at the LUFS target regardless of
+    the input boost. When omitted, we read the global setting — matches
+    the legacy behaviour exactly.
 
     Falls back to 1.0 when the file lacks metadata (pre-v0.5 captures
     or hand-authored files). When normalization is disabled via
@@ -690,11 +698,48 @@ def _nam_normalized_output_level(path: Path) -> float:
     raw = 10.0 ** (makeup_db / 20.0)
     # The inputLevel boost we apply to feed the NAM at capture-level
     # multiplies the OUTPUT too (the amp's gain is post-input). Divide
-    # the makeup by the input drive so the perceived loudness lands at
-    # the target instead of target + input_drive_dB. Capped so the
+    # the makeup by the EFFECTIVE input drive so the perceived loudness
+    # lands at the target instead of target + input_drive_dB. Callers
+    # that switch off the drive (bass amps via `_amp_input_drive_for`)
+    # pass effective_input_drive=1.0 here so the division is consistent
+    # with what was applied to the stage's inputLevel. Capped so the
     # output never goes super-quiet for a sky-high input drive setting.
-    input_drive = max(0.1, float(settings.get("nam_input_drive", 2.5)))
-    return raw / input_drive
+    effective_input = effective_input_drive
+    if effective_input is None:
+        effective_input = float(settings.get("nam_input_drive", 2.5))
+    effective_input = max(0.1, float(effective_input))
+    return raw / effective_input
+
+
+def _amp_input_drive_for(rs_gear: str | None, slot: str | None) -> float:
+    """Return the inputLevel multiplier to feed a NAM stage.
+
+    Rules:
+      - Non-amp stages (pedals/racks/master pre+post) stay at unity 1.0.
+        Driving a clean modulation pedal would over-saturate it.
+      - Bass amps (rs_gear starting with 'Bass_Amp_') also stay at
+        unity. tone3000 bass captures are typically authored at clean
+        gain settings (e.g. Gallien-Krueger RB800 G1.0 / G3.0 / G5.0).
+        Applying the guitar-amp 2.5× drive pushes the model well
+        beyond its capture-time operating point and the output
+        sounds distorted — exactly the symptom the user reported on
+        Gallien-Krueger.
+      - Guitar amps use the configured `nam_input_drive` (default 2.5).
+        Guitar captures are made at HOT gain so the model expects an
+        input that's louder than what arrives from a live pickup; the
+        boost restores capture-level signal.
+
+    Both `rs_gear` and `slot` may be None (no gear/slot context, e.g.
+    standalone audition of a file with no metadata): we still treat
+    that as a guitar amp and apply the default drive. The frontend
+    passes a sensible rs_gear whenever it can.
+    """
+    if (slot or "").lower() != "amp":
+        return 1.0
+    if rs_gear and rs_gear.startswith("Bass_"):
+        return 1.0
+    settings = _load_settings()
+    return max(0.1, float(settings.get("nam_input_drive", 2.5)))
 
 
 def _gear_rs_gain(piece: dict, gear_def: dict | None = None) -> float:
@@ -5063,6 +5108,17 @@ def setup(app, context):
                 if not path or not path.exists():
                     missing.append(payload)
                     continue
+                # Guitar-amp NAMs need inputLevel above unity to reach
+                # the saturation region of the captured model (live
+                # guitar arrives quieter than the capture-time DI).
+                # Bass amps stay at unity — tone3000 bass captures
+                # (e.g. Gallien-Krueger G1.0/G3.0) are authored at
+                # clean settings and the 2.5× drive over-saturates
+                # them. Pedal/rack NAMs also stay at unity so we
+                # don't over-drive a clean modulation/utility plugin.
+                # outputLevel divides the drive back out so perceived
+                # volume tracks the LUFS target.
+                _drive = _amp_input_drive_for(gear, slot)
                 chain.append({
                     "type": 1,
                     "name": Path(payload).stem,
@@ -5072,18 +5128,10 @@ def setup(app, context):
                     "bypassed": bypassed,
                     "slot": slot,
                     "rs_gear": gear,
-                    # Amp NAMs need inputLevel above unity to reach the
-                    # saturation region of the captured model (live guitar
-                    # arrives quieter than the capture-time DI). Pedal/
-                    # rack NAMs stay at unity so we don't over-drive a
-                    # clean modulation/utility plugin. outputLevel
-                    # divides the drive back out so the perceived volume
-                    # tracks the LUFS target regardless of input boost.
                     "state": _state_b64({
                         "modelPath": str(path),
-                        "inputLevel": (_load_settings().get("nam_input_drive", 2.5)
-                                       if slot == "amp" else 1.0),
-                        "outputLevel": _nam_normalized_output_level(path),
+                        "inputLevel": _drive,
+                        "outputLevel": _nam_normalized_output_level(path, effective_input_drive=_drive),
                     }),
                 })
             else:  # vst
@@ -5245,6 +5293,10 @@ def setup(app, context):
                     if not path or not path.exists():
                         missing.append(payload)
                         continue
+                    # Per-gear input drive: 2.5× for guitar amps, 1.0
+                    # for bass amps + every non-amp slot. See
+                    # _amp_input_drive_for for the full rationale.
+                    _drive = _amp_input_drive_for(gear, slot)
                     tone_stages.append({
                         "type": 1,
                         "name": Path(payload).stem,
@@ -5253,14 +5305,10 @@ def setup(app, context):
                         "slot": slot,
                         "rs_gear": gear,
                         "tone_key": tone_key,
-                        # Drive only the amp slot — see native_preset_full
-                        # for the rationale (avoid over-driving clean
-                        # utility pedal NAMs).
                         "state": _state_b64({
                             "modelPath": str(path),
-                            "inputLevel": (_load_settings().get("nam_input_drive", 2.5)
-                                           if slot == "amp" else 1.0),
-                            "outputLevel": _nam_normalized_output_level(path),
+                            "inputLevel": _drive,
+                            "outputLevel": _nam_normalized_output_level(path, effective_input_drive=_drive),
                         }),
                     })
                 else:  # vst
@@ -5451,12 +5499,20 @@ def setup(app, context):
     # ── Single-stage audition (catalog "Escuchar") ────────────────────
     @app.get("/api/plugins/rig_builder/native_preset_one")
     def native_preset_one(file: str = "", kind: str = "nam", gain: float = 0.5,
-                          vst_path: str = "", vst_format: str = "VST3"):
+                          vst_path: str = "", vst_format: str = "VST3",
+                          rs_gear: str = ""):
         """A native_preset with ONE stage to audition a single gear in
         isolation. `kind` selects the stage type:
           - "nam"            → NAM model from nam_models/<file>
           - "ir" / "rs_ir"   → IR from nam_irs/<file>
           - "vst"            → VST3/AU at absolute `vst_path` (file ignored)
+
+        `rs_gear` (optional) is the rs_gear_type the frontend has on
+        hand for this audition (e.g. 'Bass_Amp_CS75B'). When set, the
+        per-gear input-drive helper switches off the guitar-amp boost
+        for bass amps — bass tone3000 captures are authored at clean
+        gain and the boost over-saturates them. Falls back to a
+        filename heuristic when rs_gear is missing.
         """
         models_dir = (_config_dir / "nam_models") if _config_dir else None
         irs_dir = (_config_dir / "nam_irs") if _config_dir else None
@@ -5482,14 +5538,22 @@ def setup(app, context):
             p = _safe_child(models_dir, file)
             if not p or not p.exists():
                 return JSONResponse({"error": "model not found"}, 404)
-            # Apply the amp-only input drive when auditioning a file
-            # under nam_models/amps/. We can't see the slot in this
-            # endpoint (it's a single file, no preset context), so we
-            # use the storage subdir as the proxy — same intent as the
-            # full-chain code: drive amps, leave pedals/racks unity.
-            _is_amp = (file or "").lower().startswith("amps/")
-            _drive = (_load_settings().get("nam_input_drive", 2.5)
-                       if _is_amp else 1.0)
+            # Apply per-gear input drive. Frontend usually passes
+            # rs_gear (catalog has it on hand); when absent we fall
+            # back to the storage-subdir heuristic, treating
+            # nam_models/amps/* as a guitar amp by default. The helper
+            # automatically switches off the boost for Bass_* gears so
+            # tone3000 bass captures (Gallien-Krueger G1.0/G3.0/G5.0,
+            # CS75B, etc.) don't over-saturate.
+            _is_amp = bool(rs_gear) and rs_gear.startswith(("Amp_", "Bass_Amp_"))
+            if not rs_gear:
+                _is_amp = (file or "").lower().startswith("amps/")
+                # Heuristic-only fallback: treat as guitar amp
+                # (rs_gear="") so the default 2.5× drive applies to
+                # legacy callers that haven't yet been updated to
+                # pass rs_gear.
+            _slot_hint = "amp" if _is_amp else None
+            _drive = _amp_input_drive_for(rs_gear or None, _slot_hint)
             stage = {"type": 1, "name": Path(file).stem, "path": str(p),
                      "bypassed": False,
                      # Single-NAM audition (▶ button) — apply the same
@@ -5500,7 +5564,7 @@ def setup(app, context):
                      # still work.
                      "state": _state_b64({"modelPath": str(p),
                                           "inputLevel": _drive,
-                                          "outputLevel": float(gain) * _nam_normalized_output_level(p)})}
+                                          "outputLevel": float(gain) * _nam_normalized_output_level(p, effective_input_drive=_drive)})}
         return {"native_preset": {"version": 1, "chain": [stage]}}
 
     # ── VST plugin endpoints (Fase C: known list + assign + state) ────
