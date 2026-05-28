@@ -821,19 +821,38 @@ const RbMegaChain = (function () {
                 }).catch(() => {});
             }, delay);
         });
-        // Helper: pick the song's default tone using the same heuristic
-        // as both the early no-schedule branch and the 10 s fallback.
-        // Prefer GUITAR over BASS (avoids the "Reptilia tones[0] is bass"
-        // bug — see the 10 s fallback comment below for the full story).
-        // Caller decides what log message to emit; this just resolves
-        // which tone to apply.
+        // Helper: pick the song's default tone matched to the user's
+        // active arrangement. The bundle's highway exposes
+        // `getStringCount()` → 4 = bass, 6/7/8 = guitar, which is the
+        // authoritative signal for what the user is plucking right
+        // now. Picking the wrong family is the user-visible bug we're
+        // here to fix: a bass-playing user got a guitar tone applied
+        // 1.5 s into the song (overriding the bundle's correct intro)
+        // because the old heuristic blindly preferred non-bass tones.
+        //
+        // Strategy:
+        //   - 4 strings → pick a bass tone (filter to bass-flavored)
+        //   - 6+ strings → pick a guitar tone (filter out bass-flavored)
+        //   - unknown / no matching tone → fall back to tones[0]
         const _pickDefaultTone = () => {
             const all = (mega.tones || []);
             if (!all.length) return null;
             const isBassFlavored = t =>
                 /(^|_)bass(_|\b)/i.test(t.tone_key || '')
                 || (Array.isArray(t.chain) && t.chain.some(p => /^Bass_/i.test(p.rs_gear || '')));
-            return all.find(t => !isBassFlavored(t)) || all[0];
+            let stringCount = 6;
+            try {
+                const hw = window.highway;
+                if (hw && typeof hw.getStringCount === 'function') {
+                    const n = hw.getStringCount();
+                    if (typeof n === 'number' && n > 0) stringCount = n;
+                }
+            } catch (_) {}
+            const wantBass = stringCount <= 4;
+            const preferred = wantBass
+                ? all.find(t => isBassFlavored(t))
+                : all.find(t => !isBassFlavored(t));
+            return preferred || all[0];
         };
 
         // Early no-schedule detector: most songs that hit the old
