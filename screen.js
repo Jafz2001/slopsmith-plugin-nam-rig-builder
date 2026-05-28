@@ -1691,6 +1691,13 @@ async function rbLoadSongTones(filename) {
         el.innerHTML = `<p class="text-red-400">Error rendering tones: ${rbEsc(e.message)}</p>`;
         return;
     }
+    // Auto-scroll the editor into view so picking a song from the (long)
+    // song list doesn't leave the user staring at the same list — they
+    // expect to land in the editor immediately. requestAnimationFrame
+    // lets the layout settle before measuring.
+    requestAnimationFrame(() => {
+        try { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+    });
 
     // Auto-download trigger: if the user has an API key and any chain
     // piece is unassigned, kick off the song-scoped download flow.
@@ -1910,30 +1917,37 @@ function rbRenderChainStrip(tone, toneIdx, selectedPIdx) {
 
 function rbRenderPieceCard(p, toneIdx, pIdx, isSelected, total) {
     const bypassed = !!p._bypassed;
-    // Effective assignment for the badge color.
+    // Effective assignment — drives the status dot colour.
     const hasVst = (p._vst_kind === 'vst' || (p.assigned && p.assigned.kind === 'vst' && p.assigned.vst_path));
     const hasFile = !hasVst && !!(p._uploaded_file || (p.assigned && p.assigned.file));
-    let statusDot;
+    // Status dot at the top-right. When bypassed, the dot "turns off":
+    // a small ringed gray pip mirroring the unassigned style, so the
+    // user knows the stage is dark even when it's still wired up.
+    let dotColor, dotTitle;
     if (bypassed) {
-        statusDot = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-amber-400" title="Bypassed"></span>';
+        dotColor = 'bg-gray-800 ring-1 ring-gray-700';
+        dotTitle = 'Bypassed — stage skipped (signal passes through)';
     } else if (hasVst) {
-        statusDot = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-purple-400" title="VST plugin loaded"></span>';
+        dotColor = 'bg-purple-400';
+        dotTitle = 'VST plugin loaded';
     } else if (hasFile) {
-        statusDot = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-green-400" title="NAM/IR assigned"></span>';
+        dotColor = 'bg-green-400';
+        dotTitle = 'NAM/IR assigned';
     } else {
-        statusDot = '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-gray-600 ring-1 ring-gray-700" title="Unassigned"></span>';
+        dotColor = 'bg-gray-600 ring-1 ring-gray-700';
+        dotTitle = 'Unassigned';
     }
+    const statusDot = `<span class="absolute top-1 right-1 w-2 h-2 rounded-full ${dotColor}" title="${rbEsc(dotTitle)}"></span>`;
     const selCls = isSelected
         ? 'border-accent ring-2 ring-accent/40 bg-dark-700'
         : 'border-gray-800 hover:border-gray-600 bg-dark-800/70';
-    const bypassedOverlay = bypassed
-        ? '<div class="absolute inset-0 bg-dark-900/40 pointer-events-none rounded-lg"></div>'
-        : '';
+    // When bypassed, drop the photo to grayscale + dim it so the card
+    // visually reads as "off" — pairs nicely with the dimmed status dot.
+    const imgBypassCls = bypassed ? 'grayscale opacity-40' : '';
     // Photo lookup: backend returns 404 when no Rocksmith art exists for
     // this rs_gear. The onerror swaps the broken <img> for the sibling
-    // placeholder via plain DOM properties — avoids any HTML-in-attribute
-    // escaping problems (which earlier broke the chain layout by leaking
-    // a stray placeholder div into the card body).
+    // placeholder via plain DOM properties — avoids HTML-in-attribute
+    // escaping bugs.
     const imgUrl = `${RB_API}/gear_photo/${encodeURIComponent(p.type)}`;
     const onerr = "this.style.display='none'; var n=this.nextElementSibling; if(n) n.classList.remove('hidden');";
     return `
@@ -1945,17 +1959,16 @@ function rbRenderPieceCard(p, toneIdx, pIdx, isSelected, total) {
             </div>
             <div class="flex justify-center items-center mb-1.5 h-20">
                 <img src="${imgUrl}" alt="" loading="lazy"
-                     class="max-w-full max-h-full rounded object-contain bg-dark-900"
+                     class="max-w-full max-h-full rounded object-contain bg-dark-900 transition ${imgBypassCls}"
                      onerror="${onerr}">
-                <div class="hidden w-full h-full rounded bg-dark-900 flex items-center justify-center text-[10px] text-gray-600 text-center px-1 leading-tight">
+                <div class="hidden w-full h-full rounded bg-dark-900 flex items-center justify-center text-[10px] text-gray-600 text-center px-1 leading-tight ${imgBypassCls}">
                     ${rbEsc(p.rs_category || 'gear')}
                 </div>
             </div>
-            <div class="text-[11px] text-gray-200 leading-tight line-clamp-2 min-h-[2.2em]" title="${rbEsc(p.real_name || p.type)}">
+            <div class="text-[11px] ${bypassed ? 'text-gray-500' : 'text-gray-200'} leading-tight line-clamp-2 min-h-[2.2em]" title="${rbEsc(p.real_name || p.type)}">
                 ${rbEsc(p.real_name || p.type)}
             </div>
             ${statusDot}
-            ${bypassedOverlay}
         </button>`;
 }
 
@@ -1983,8 +1996,11 @@ function rbRenderEditorFooter(toneIdx, filename) {
 }
 
 function rbRenderPieceEditor(p, toneIdx, pIdx, filename) {
+    // NAM / IR uploads and Library picks happen exclusively from the
+    // All Gear tab now — they're catalog-level operations, not
+    // per-song. The song editor only deals with chain-level decisions
+    // (variant override, gear swap, reorder, bypass, VST params).
     const isCab = p.rs_category === 'cab';
-    const acceptExt = isCab ? '.wav' : '.nam';
     const pendingKind = p._uploaded_kind || p._vst_kind;
     const assignedKind = p.assigned && p.assigned.kind;
     const effKind = pendingKind || assignedKind || (isCab ? 'ir' : 'nam');
@@ -2136,12 +2152,6 @@ function rbRenderPieceEditor(p, toneIdx, pIdx, filename) {
                         class="bg-purple-900/30 hover:bg-purple-900/50 text-purple-300 border border-purple-800/40 px-3 py-1.5 rounded text-xs">
                     🎛 Edit VST
                 </button>` : ''}
-                <label class="text-xs text-gray-500 flex items-center gap-1 cursor-pointer hover:text-gray-300">
-                    <span>⬆ Upload ${isCab ? 'IR' : 'NAM'}</span>
-                    <input type="file" accept="${acceptExt}"
-                           onchange="rbUploadFile(this, ${toneIdx}, ${pIdx})"
-                           class="hidden">
-                </label>
                 <div class="flex-1"></div>
                 <button onclick="rbMovePiece(${toneIdx}, ${pIdx}, -1)"
                         title="Move earlier in the signal flow"
