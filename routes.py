@@ -3763,9 +3763,142 @@ def _watch_fire(name: str) -> None:
             "downloaded": result.get("downloaded"),
         }
         log.info("rig_builder watcher auto-downloaded %s: %s", name, result)
+        # Also fix cab assignments right after the download. Materialised
+        # songs whose DLC PSARC ships `Cabinet.Type='Cabinets'` get the
+        # real cab + correct mic IR baked into preset_pieces here — the
+        # user doesn't need to open the song in the editor for the fix
+        # to land. Idempotent: already-correct rows are no-ops.
+        try:
+            if path.suffix.lower() == ".sloppak":
+                raw_tones = _read_tones_from_sloppak(name, _get_dlc_dir())
+            else:
+                raw_tones = _read_tones_from_psarc(path)
+            _auto_fix_cab_mics_for_song_module(name, raw_tones)
+        except Exception:
+            log.exception("rig_builder watcher cab-mic fix failed for %s", name)
     except Exception as e:
         log.exception("rig_builder watcher auto-download failed for %s", name)
         _watcher_state["last_error"] = f"{name}: {type(e).__name__}: {e}"
+
+
+def _self_heal_cabs_for_preset(preset_id: int, conn) -> int:
+    """Resolve the preset's filename + tone_key via tone_mappings, then
+    run the cab-mic fix scoped to THAT preset only.
+
+    Called from `native_preset_full` on every playback. The caller has
+    already short-circuited via a cheap SELECT (only fires when a row
+    actually looks fixable — generic 'Cabinets' OR auto-mode with a
+    `_00.wav` file), so this PSARC parse only runs when there's work
+    to do. Idempotent: re-runs are no-ops once the row has been
+    promoted to the real cab + correct mic IR.
+    """
+    if _config_dir is None:
+        return 0
+    row = conn.execute(
+        "SELECT filename, tone_key FROM tone_mappings "
+        "WHERE preset_id = ? LIMIT 1",
+        (preset_id,),
+    ).fetchone()
+    if not row:
+        return 0
+    filename, _tone_key = row
+    path = _resolve_song_file(filename)
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        return 0
+    try:
+        if path.suffix.lower() == ".sloppak":
+            raw_tones = _read_tones_from_sloppak(filename, _get_dlc_dir())
+        else:
+            raw_tones = _read_tones_from_psarc(path)
+    except Exception:
+        log.warning("self-heal: parse %s failed", filename, exc_info=True)
+        return 0
+    return _auto_fix_cab_mics_for_song_module(filename, raw_tones)
+
+
+def _auto_fix_cab_mics_for_song_module(filename: str, raw_tones: list) -> int:
+    """Module-level version of the per-song cab-mic fixer (the closure
+    `_auto_fix_cab_mics_for_song` inside setup() captures `conn`/`_lock`
+    via the outer scope; this twin is callable from the watcher + the
+    playback path without going through the FastAPI handler).
+
+    Walks each tone's Cabinet.Key, resolves to (base_rs_gear, suffix)
+    via rs_cab_mic_map, and updates every preset_piece for that tone
+    so rs_gear_type + file land on the correct cab + mic IR. Skips
+    real manual picks (assigned_mode='manual' AND a real rs_gear_type
+    that isn't 'Cabinets'); always force-fixes the generic 'Cabinets'
+    placeholder. Returns the number of rows updated.
+    """
+    if _config_dir is None or not raw_tones:
+        return 0
+    irs_root = _config_dir / "nam_irs"
+    conn = _get_conn()
+    base_name = filename.rsplit("/", 1)[-1]
+    tm_rows = conn.execute(
+        "SELECT tone_key, preset_id FROM tone_mappings "
+        "WHERE filename = ? OR filename = ?",
+        (filename, base_name),
+    ).fetchall()
+    if not tm_rows:
+        return 0
+    tone_to_preset = {tk: pid for tk, pid in tm_rows}
+    updated = 0
+    affected: set[int] = set()
+    with _lock:
+        for raw in raw_tones:
+            tone_key = raw.get("Key") or raw.get("Name") or ""
+            preset_id = tone_to_preset.get(tone_key)
+            if preset_id is None:
+                continue
+            cab = (raw.get("GearList") or {}).get("Cabinet") or {}
+            effect_name = (cab.get("Key") or "").strip()
+            if not effect_name:
+                continue
+            base_rs_gear = _cab_base_from_effect_name(effect_name)
+            suffix = _cab_suffix_from_effect_name(effect_name)
+            if not base_rs_gear or not suffix:
+                continue
+            spec = (_load_rs_cab_mic_map().get(base_rs_gear) or {}).get(suffix)
+            new_file = (spec or {}).get("ir_file")
+            if not new_file or not (irs_root / new_file).exists():
+                continue
+            base_lc = base_rs_gear.lower()
+            rows = conn.execute(
+                "SELECT id, rs_gear_type, file, assigned_mode "
+                "FROM preset_pieces "
+                "WHERE preset_id = ? "
+                "  AND (rs_gear_type = 'Cabinets' "
+                "       OR LOWER(rs_gear_type) = ? "
+                "       OR LOWER(rs_gear_type) LIKE ?)",
+                (preset_id, base_lc, base_lc + "_%"),
+            ).fetchall()
+            for row_id, rs_gear, cur_file, mode in rows:
+                is_generic = (rs_gear == "Cabinets")
+                if mode == "manual" and not is_generic:
+                    continue
+                needs_promote = (rs_gear != base_rs_gear)
+                if not needs_promote and cur_file == new_file:
+                    continue
+                if needs_promote:
+                    conn.execute(
+                        "UPDATE preset_pieces "
+                        "SET rs_gear_type = ?, file = ?, kind = 'rs_ir' "
+                        "WHERE id = ?",
+                        (base_rs_gear, new_file, row_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE preset_pieces "
+                        "SET file = ?, kind = 'rs_ir' WHERE id = ?",
+                        (new_file, row_id),
+                    )
+                updated += 1
+                affected.add(preset_id)
+        if updated:
+            for pid in affected:
+                _recompute_preset_primaries(conn, pid)
+            conn.commit()
+    return updated
 
 
 def _start_watcher() -> None:
@@ -4841,6 +4974,31 @@ def setup(app, context):
         if not prow:
             return JSONResponse({"error": "preset not found"}, 404)
         _, name, input_gain, output_gain, gate_threshold = prow
+
+        # Self-heal cab assignment on every playback. If ANY cab piece
+        # for this preset still has rs_gear='Cabinets' (generic
+        # placeholder) OR is mode='auto' with a file that doesn't yet
+        # match the PSARC's Cabinet.Key, fix it now so the playback
+        # hears the correct mic position even if the user never opened
+        # the Songs editor. The needs-fix check is cheap (one indexed
+        # SELECT); only if it indicates work do we incur the PSARC
+        # parse cost.
+        needs_cab_fix = conn.execute(
+            "SELECT 1 FROM preset_pieces "
+            "WHERE preset_id = ? AND ("
+            "  rs_gear_type = 'Cabinets' "
+            "  OR (kind IN ('rs_ir', 'ir') "
+            "      AND assigned_mode = 'auto' "
+            "      AND file LIKE '%\\_00.wav' ESCAPE '\\') "
+            ") LIMIT 1",
+            (preset_id,),
+        ).fetchone()
+        if needs_cab_fix:
+            try:
+                _self_heal_cabs_for_preset(preset_id, conn)
+            except Exception:
+                log.exception("self-heal cabs failed for preset_id=%s",
+                              preset_id)
 
         rows = conn.execute(
             "SELECT slot, kind, file, rs_gear_type, bypassed, slot_order, "
