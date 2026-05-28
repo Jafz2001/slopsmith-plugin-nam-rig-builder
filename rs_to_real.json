@@ -2195,12 +2195,10 @@
     "category": "amp",
     "gain_variants": {
       "clean": {
-        "curator": "Nacho",
-        "model_id": 265508,
-        "notes": "Hartke HA 3500 Tube 0 Solid State 5 All Flat",
+        "model_id": 265504,
         "rs_gain_range": [
-          0.0,
-          35.0
+          0,
+          35
         ],
         "tone3000_id": 48296
       },
@@ -2232,38 +2230,7 @@
     "query_source": "generic",
     "sound_bank": "bass_amp_cs300b",
     "tone3000_gears": "amp",
-    "tone3000_query": "bass amp",
-    "gain_variants": {
-      "clean": {
-        "tone3000_id": 48296,
-        "rs_gain_range": [
-          0,
-          35
-        ],
-        "model_id": 265504
-      },
-      "crunch": {
-        "tone3000_id": 48296,
-        "model_id": 265504,
-        "rs_gain_range": [
-          35.0,
-          70.0
-        ],
-        "notes": "Hartke HA 3500 ALL FLAT Tube and Solid State at 5",
-        "curator": "Nacho"
-      },
-      "dist": {
-        "tone3000_id": 48296,
-        "model_id": 265550,
-        "rs_gain_range": [
-          70.0,
-          100.0
-        ],
-        "notes": "Hartke HA 3500 Tube 3 Solid State 8 All Flat",
-        "curator": "Nacho"
-      }
-    },
-    "rs_order": 563
+    "tone3000_query": "bass amp"
   },
   "Bass_Amp_CS75B": {
     "art_asset": "cs-75b",

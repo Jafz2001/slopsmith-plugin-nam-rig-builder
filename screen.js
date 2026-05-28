@@ -2326,7 +2326,21 @@ function rbRenderPiece(p, toneIdx, pIdx) {
 function rbFilterVstParams(params) {
     return (params || []).filter(p => {
         const n = String(p.name ?? p.label ?? '').trim();
-        return !/^midi\s*cc\b/i.test(n);
+        // MIDI CC / MIDI Learn assignments — never user-meaningful in our
+        // chain editor.
+        if (/^midi/i.test(n)) return false;
+        // Generic 'Param 1..4' placeholders. Melda exposes 4 of these on
+        // most of its free plugins as preset-mappable hooks; they have no
+        // effect unless wired in the Melda UI to a sound param.
+        if (/^param\s+\d+$/i.test(n)) return false;
+        // Preset cycling triggers ('previous (Preset trigger)' / 'next
+        // (Preset trigger)') — host-automation hooks, not sound params.
+        if (/\(\s*preset\s+trigger\s*\)/i.test(n)) return false;
+        // Bypass + Program — the chain editor has its own dedicated
+        // Bypass UI; Program is an internal patch index irrelevant here.
+        if (/^bypass$/i.test(n)) return false;
+        if (/^program$/i.test(n)) return false;
+        return true;
     });
 }
 
