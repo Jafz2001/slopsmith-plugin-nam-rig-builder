@@ -84,10 +84,14 @@ _VST_PARAM_RANGES: dict[str, dict[str, tuple[str, float, float]]] = {
         "Gain":        ("linear", -24.0, 24.0),
         "Output gain": ("linear", -24.0, 24.0),
         "Threshold":   ("linear", -80.0,  0.0),
+        # NB: Attack / Release / RMS length intentionally omitted. The curator's
+        # `scale=0.01` mappings (RS 0-100 → 0-1) already produce normalized
+        # values; applying a log range here would re-normalize and yield
+        # nonsense (e.g. Attack=0.5 treated as 0.5 ms display → re-norm via
+        # log 0.01..1000 → 0.175 actual → ≈0.5 ms display = wrong direction).
+        # Threshold + Gain stay because the curator's scale=-1.0 / scale=1.0
+        # produces dB values that DO need display→normalized conversion.
         "Ratio":       ("log",     1.0, 100.0),
-        "Attack":      ("log",     0.01, 1000.0),
-        "Release":     ("log",     0.5, 10000.0),
-        "RMS length":  ("log",     0.1, 1000.0),
         "Knee size":   ("linear",  0.0, 100.0),
     },
     "mequalizer": {
@@ -130,9 +134,10 @@ _VST_PARAM_RANGES: dict[str, dict[str, tuple[str, float, float]]] = {
     # 0..100% sliders already, so most curated mappings (scale=0.01) land in
     # [0,1] without help. Only the dB/Hz params need ranges here.
     "khs compressor": {
+        # Same convention as mcompressor: Threshold + Makeup are dB so range
+        # them; Attack / Release / Ratio rely on the curator's normalized
+        # mapping (scale=0.01) so no range here (range would double-normalize).
         "Threshold":   ("linear", -60.0, 0.0),
-        "Attack":      ("log",     0.1, 1000.0),
-        "Release":     ("log",     1.0, 10000.0),
         "Makeup gain": ("linear", -24.0, 24.0),
     },
     "khs 3-band eq": {
