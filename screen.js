@@ -4198,10 +4198,20 @@ async function rbLoadAndEditVst(toneIdx, pIdx) {
 // JSON by index — assumes loadPreset preserves order, which is what the
 // audio_engine plugin code path also relies on (see bundle screen.js).
 async function rbReapplyVstParamsToChain(api, chainSpec) {
-    if (typeof api.getChainState !== 'function' || typeof api.setParameter !== 'function') return;
+    if (typeof api.getChainState !== 'function' || typeof api.setParameter !== 'function') {
+        console.warn('[rig_builder reapply] api.getChainState or setParameter missing — walker skipped');
+        return;
+    }
     let loaded;
-    try { loaded = await api.getChainState(); } catch (_) { return; }
-    if (!Array.isArray(loaded)) return;
+    try { loaded = await api.getChainState(); } catch (e) {
+        console.warn('[rig_builder reapply] getChainState failed:', e);
+        return;
+    }
+    if (!Array.isArray(loaded)) {
+        console.warn('[rig_builder reapply] getChainState returned non-array:', loaded);
+        return;
+    }
+    console.log(`[rig_builder reapply] chain has ${loaded.length} loaded stage(s); spec has ${chainSpec.length}`);
     // Walk the SPEC and the LOADED state together. We rely on
     // index alignment — both lists are in signal-flow order.
     for (let i = 0; i < chainSpec.length && i < loaded.length; i++) {
@@ -4226,6 +4236,7 @@ async function rbReapplyVstParamsToChain(api, chainSpec) {
         }
         if (!params || Object.keys(params).length === 0) continue;
         const slotId = slot.id ?? slot.slotId ?? i;
+        console.log(`[rig_builder reapply] stage ${i} (slot ${slotId}): ${Object.keys(params).length} params to apply — keys: ${Object.keys(params).slice(0, 5).join(', ')}${Object.keys(params).length > 5 ? '…' : ''}`);
 
         // Resolve param NAMES (string keys) to IDs via getParameters(),
         // same pattern as the manual ⇶ Apply RS settings flow. Keys that
@@ -4246,24 +4257,38 @@ async function rbReapplyVstParamsToChain(api, chainSpec) {
                         const pname = (p.name ?? p.label ?? '').toLowerCase();
                         if (pname) nameToId[pname] = pid;
                     });
+                    console.log(`[rig_builder reapply] slot ${slotId}: getParameters returned ${paramList.length} params; first 5 names: ${paramList.slice(0, 5).map(p => p.name || p.label).join(' | ')}`);
+                } else {
+                    console.warn(`[rig_builder reapply] slot ${slotId}: getParameters returned non-array:`, paramList);
                 }
-            } catch (_) { /* fall through; numeric-only keys still work */ }
+            } catch (e) {
+                console.warn(`[rig_builder reapply] slot ${slotId}: getParameters threw:`, e);
+            }
         }
 
+        let appliedCount = 0;
+        const failed = [];
         for (const [pid, v] of Object.entries(params)) {
             let targetId = parseInt(pid, 10);
             if ((isNaN(targetId) || String(targetId) !== String(pid).trim()) && nameToId) {
                 targetId = nameToId[String(pid).toLowerCase()];
             }
             if (targetId == null || isNaN(targetId)) {
-                console.warn(`[rig_builder] couldn't resolve VST param '${pid}' for slot ${slotId} — ignoring`);
+                failed.push(pid);
                 continue;
             }
             try {
                 await api.setParameter(slotId, targetId, parseFloat(v));
+                appliedCount++;
             } catch (e) {
-                console.warn(`[rig_builder] setParameter slot=${slotId} param=${pid}(${targetId}):`, e);
+                console.warn(`[rig_builder reapply] setParameter slot=${slotId} param=${pid}(${targetId}):`, e);
+                failed.push(`${pid}(setParam threw)`);
             }
+        }
+        if (failed.length) {
+            console.warn(`[rig_builder reapply] slot ${slotId}: applied ${appliedCount} params, failed: ${failed.join(', ')}`);
+        } else {
+            console.log(`[rig_builder reapply] slot ${slotId}: applied ${appliedCount} params ✓`);
         }
     }
 }
