@@ -6601,8 +6601,11 @@ async function rbLoadSettings() {
     if (megaCb) megaCb.checked = !!s.mega_chain_mode;
     const bac = document.getElementById('rb-bypass-all-cabs');
     if (bac) bac.checked = !!s.bypass_all_cabs;
-    const curOnly = document.getElementById('rb-curated-only');
-    if (curOnly) curOnly.checked = !!s.curated_only;
+    // Inverted-sense checkbox: the user opts OUT of curated-only by
+    // ticking the box (= allow tone3000 fuzzy fallback). The persisted
+    // setting is still `curated_only`; the UI just shows the opposite.
+    const allowFuzzy = document.getElementById('rb-allow-tone3000-fallback');
+    if (allowFuzzy) allowFuzzy.checked = !s.curated_only;
     // Mirror the persisted flag onto the runtime mirror so RbMegaChain
     // sees it even if the user never opens Settings. rbLoadSettings is
     // called from rbInit so this runs at page-load.
@@ -6689,16 +6692,18 @@ async function rbSaveSettings() {
     window.__rbMegaChainSetting = mega_chain_mode;
 }
 
-// Toggle "🎯 Curated only" mode from the Setup tab. Persists the
-// flag so both the batch worker and the per-song auto-download
-// honour it on the next run. No alert/confirmation — the next batch
-// click acts on the new value.
-async function rbSetCuratedOnly(on) {
+// Opt-out toggle for the curated-only flow. The checkbox shows the
+// INVERSE of the persisted `curated_only` setting:
+//   - unchecked → curated_only = true  (default, recommended)
+//   - checked   → curated_only = false (allow tone3000 fuzzy fallback)
+// Persists immediately so the next Scan / song-open honours the
+// new value.
+async function rbSetAllowTone3000Fallback(checked) {
     try {
         await fetch(`${RB_API}/settings`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ curated_only: !!on }),
+            body: JSON.stringify({ curated_only: !checked }),
         });
     } catch (e) { /* best-effort */ }
 }

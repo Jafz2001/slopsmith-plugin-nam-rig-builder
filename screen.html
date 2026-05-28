@@ -212,12 +212,12 @@
                 </li>
                 <li>
                     <span class="font-medium">Scan library &amp; auto-assign</span>
-                    — walks every song and assigns captures to each gear from
-                    the curated 1-to-1 mappings (<span class="text-emerald-300">🎯 Curated only</span>
-                    is on by default). Anything not curated lands in
+                    — walks every song and assigns captures from the curated
+                    1-to-1 mappings only. Anything uncurated lands in
                     <span class="text-amber-300">pending</span> for you to
-                    pick later. Uncheck the box if you want the legacy
-                    tone3000 fuzzy fallback.
+                    pick later. Tick the <span class="text-amber-300">⚠ Allow tone3000
+                    fuzzy fallback</span> box below if you want the plugin to
+                    auto-search tone3000 for uncurated gears instead.
                 </li>
                 <li>
                     <span class="font-medium">Refine in the Gear catalog</span>
@@ -253,15 +253,15 @@
                 unless you turn that step off below.
             </p>
             <label class="flex items-start gap-2 mb-4 text-sm cursor-pointer">
-                <input type="checkbox" id="rb-curated-only" checked
-                       onchange="rbSetCuratedOnly(this.checked)"
-                       class="mt-1 accent-emerald-500">
+                <input type="checkbox" id="rb-allow-tone3000-fallback"
+                       onchange="rbSetAllowTone3000Fallback(this.checked)"
+                       class="mt-1 accent-amber-500">
                 <span class="text-gray-300">
-                    <span class="font-medium">🎯 Curated only</span>
-                    <span class="text-gray-500 ml-1">(on by default — recommended)</span>
+                    <span class="font-medium text-amber-300">⚠ Allow tone3000 fuzzy fallback</span>
+                    <span class="text-gray-500 ml-1">(opt-out from curated-only)</span>
                     <div class="text-gray-500 mt-1 leading-snug">
-                        <strong class="text-gray-400">✓ Checked (current):</strong>
-                        only use the curated 1-to-1 mappings in
+                        Leave <strong class="text-gray-400">unchecked</strong> (recommended) and the plugin
+                        will only use the curated 1-to-1 mappings in
                         <code class="bg-dark-800 px-1 rounded">rs_to_real.json</code> +
                         <code class="bg-dark-800 px-1 rounded">default_captures.json</code>.
                         Gears without a curated default land in
@@ -269,10 +269,10 @@
                         manually via Gear → 📚 Library / 🎚 Variants.
                     </div>
                     <div class="text-gray-500 mt-1 leading-snug">
-                        <strong class="text-gray-400">☐ Unchecked:</strong>
-                        if a gear has no curated pick, search tone3000 for a
-                        similar one and auto-download it. Useful only when your
-                        library isn't fully curated yet; the shipped repo is.
+                        Check this box only if your library has lots of uncurated
+                        gear and you want the plugin to fuzzy-search tone3000 and
+                        auto-download a "best guess" capture for each. The shipped
+                        repo is fully curated, so most users should leave it off.
                     </div>
                 </span>
             </label>
