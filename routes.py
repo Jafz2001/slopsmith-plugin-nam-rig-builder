@@ -6602,12 +6602,22 @@ def setup(app, context):
                 if not file:
                     skipped += 1
                     continue
+                # Promote rs_gear_type to the TARGET gear too. Original
+                # design kept the FROM gear as the identifier so
+                # Rocksmith's PSARC still labels it as "Plexi" while it
+                # sounded like JCM800 — but users found that confusing
+                # (the chain card still said "Cabinets" / "Plexi" after a
+                # swap). Replacing the gear in full is the intuitive
+                # behaviour: the chain now shows PA600C with its photo
+                # and mic positions; the actual sound matches. The link
+                # back to the PSARC's tone is via tone_mappings, not
+                # rs_gear_type, so this doesn't break anything else.
                 conn.execute(
                     "UPDATE preset_pieces "
-                    "SET file = ?, kind = ?, tone3000_id = ?, "
-                    "    assigned_mode = 'manual' "
+                    "SET rs_gear_type = ?, file = ?, kind = ?, "
+                    "    tone3000_id = ?, assigned_mode = 'manual' "
                     "WHERE id = ?",
-                    (file, kind or "nam", tone3000_id, pid_row),
+                    (to_gear, file, kind or "nam", tone3000_id, pid_row),
                 )
                 updated += 1
                 affected_presets.add(preset_id)
