@@ -6545,9 +6545,23 @@ def setup(app, context):
         rs_map = _load_rs_to_real() or {}
         to_info = rs_map.get(to_gear) or {}
         to_category = (to_info.get("category") or "").lower()
-        # Cabs use rs_cab_mic_map (any mic position with an IR on disk
-        # is enough); only amps/pedals/racks require curated gain_variants.
-        if to_category == "cab":
+        # Detect cabs by ANY of:
+        #   1. category=='cab' in rs_to_real (works when the base key
+        #      exists, which is rare for cabs — only for novelty ones)
+        #   2. presence in rs_cab_mic_map (HIRC-derived, keyed by base)
+        #   3. codename prefix (Cab_/Bass_Cab_)
+        # The gears_in_category picker collapses mic-suffix variants to
+        # the base form, so `to_gear` is e.g. "Cab_Marshall1960a" — that
+        # base form isn't a literal key in rs_to_real.json (only
+        # `Cab_Marshall1960a_5c`, `_5e`, … are). Without this looser
+        # detection the swap fell through to the gain_variants check
+        # and errored as if the cab were an amp.
+        is_cab_target = (
+            to_category == "cab"
+            or (_load_rs_cab_mic_map().get(to_gear) is not None)
+            or to_gear.lower().startswith(("cab_", "bass_cab_"))
+        )
+        if is_cab_target:
             if not (_load_rs_cab_mic_map().get(to_gear) or
                     (_load_rs_cab_to_ir().get(to_gear) or {}).get("irs")):
                 return JSONResponse(
