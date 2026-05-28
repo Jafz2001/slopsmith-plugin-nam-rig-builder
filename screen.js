@@ -124,17 +124,60 @@
 // don't all refetch — the boot-time fetch in rbInit / mega-chain hook
 // populates it. Falls back to 8.0 if the cache hasn't loaded yet.
 //
+// BASS handling: tone3000 bass captures (Gallien-Krueger G1.0/G3.0/G5.0,
+// CS75B, Bassman, etc.) are typically authored at clean gain settings,
+// so the guitar-amp 8× drive over-saturates them — the model is being
+// fed +18 dB beyond its capture-time operating point. For bass songs
+// (4-string arrangement) or auditioning a Bass_* gear, we use unity
+// (1.0) drive instead. Detection sources, in priority:
+//   1. opts.isBass: explicit override (audition path passes this based
+//      on rs_gear, which the gear catalog has on hand)
+//   2. window.highway.getStringCount() <= 4 (song-playback path; the
+//      bundle publishes string count from the song_info payload)
+//   3. fall through to guitar drive
+//
 // The engine resets input gain to 1.0 on every chain reload, so we
 // have to re-apply after each loadPreset. Hooks:
 //   - fetch interceptor (bundle's chain load)
 //   - mega-chain build (initial preload at song start)
 //   - rbListenTone (Listen ▶ in per-song view)
 //   - rbAuditionFile (▶ in Gear catalog)
-function rbApplyChainInputDrive() {
+function rbApplyChainInputDrive(opts) {
     const audio = window.slopsmithDesktop && window.slopsmithDesktop.audio;
     if (!audio || typeof audio.setGain !== 'function') return;
-    const drive = (typeof window.__rbChainInputDrive === 'number' && window.__rbChainInputDrive > 0)
-        ? window.__rbChainInputDrive : 8.0;
+    let isBass = (opts && opts.isBass === true);
+    if (!isBass && !(opts && opts.isBass === false)) {
+        try {
+            const hw = window.highway;
+            const sc = hw && typeof hw.getStringCount === 'function'
+                ? hw.getStringCount() : null;
+            if (typeof sc === 'number' && sc > 0 && sc <= 4) isBass = true;
+        } catch (_) {}
+    }
+    let drive;
+    if (isBass) {
+        drive = 1.0;
+    } else {
+        drive = (typeof window.__rbChainInputDrive === 'number' && window.__rbChainInputDrive > 0)
+            ? window.__rbChainInputDrive : 8.0;
+    }
+    // Re-poll guard: the song-playback callers fire this ~600 ms after
+    // the bundle's chain load — but `highway.getStringCount()` may not
+    // have absorbed the song_info WS message yet (it defaults to 6
+    // until the first song_info arrives). For a bass arrangement that
+    // means we'd land here once with guitar drive (8×), distort the
+    // bass amp, and never re-check. Schedule two cheap re-applies at
+    // +1500 ms and +3500 ms post-initial-call; each one re-runs the
+    // detection. If stringCount has flipped to 4 by then we update the
+    // gain. No-op if it's still guitar (setGain to the same value is
+    // idempotent on the engine side). Skipped when the caller passed
+    // an explicit isBass — they already KNOW the answer (catalog
+    // audition path).
+    const calledExplicitly = opts && (opts.isBass === true || opts.isBass === false);
+    if (!calledExplicitly && !opts?._isRepoll) {
+        setTimeout(() => rbApplyChainInputDrive({ _isRepoll: true }), 1500);
+        setTimeout(() => rbApplyChainInputDrive({ _isRepoll: true }), 3500);
+    }
     return audio.setGain('input', drive).catch((e) => {
         console.warn('[rig_builder] setGain(input,', drive, ') failed:', e);
     });
@@ -400,6 +443,16 @@ let rbState = {
 };
 
 const RB_API = '/api/plugins/rig_builder';
+
+// Cache-bust query for gear-photo URLs. Set once per session so:
+//   - 200 responses still ETag-validate on each refresh (no extra
+//     network traffic — the param doesn't change between renders)
+//   - 404 responses cached by the browser from BEFORE a fix (e.g.
+//     the case-insensitive lookup landed) get a new URL on the next
+//     Slopsmith launch, busting the stale cache miss
+// The current epoch is plenty unique; we only need it to differ
+// across plugin restarts.
+const _RB_GEAR_PHOTO_CB = `?cb=${Date.now()}`;
 const NAM_API = '/api/plugins/nam_tone';
 
 // ── RbMegaChain: pre-loaded whole-song chain with bypass-flip switching
@@ -452,7 +505,22 @@ const RbMegaChain = (function () {
         return (a && typeof a.loadPreset === 'function') ? a : null;
     }
 
-    function _resolveActiveToneKey() {
+    // `opts.useFirstChangeIfNoBase`: when set, and the highway didn't
+    // publish a tone base but DID publish a non-empty `toneChanges`
+    // schedule, use the FIRST scheduled change's tone name as the
+    // intro. Some songs (notably Bon Jovi "Livin' on a Prayer", Police
+    // "Message in a Bottle", anything where Slopsmith's PSARC parser
+    // populated the change list but not the base) leave `getToneBase`
+    // empty even though the schedule is fully there — without this
+    // option, we'd fall through to a heuristic guess after the 10 s
+    // timeout. WITH this option, the intro tone lands ~100 ms after
+    // song:loaded, exactly like for well-formed songs.
+    //
+    // Default off so the regular polling loop still distinguishes
+    // "no base + no changes yet" (return null → keep waiting) from
+    // "no base + schedule populated" (return first scheduled tone).
+    // The recheck schedule + the final-fallback timer pass `true`.
+    function _resolveActiveToneKey(opts) {
         try {
             const hw = window.highway;
             if (!hw || typeof hw.getTime !== 'function') return null;
@@ -464,6 +532,10 @@ const RbMegaChain = (function () {
                 for (const tc of changes) {
                     if (tc && tc.t <= t) active = tc.name;
                     else break;
+                }
+                if (!active && opts && opts.useFirstChangeIfNoBase
+                    && changes.length > 0 && changes[0] && changes[0].name) {
+                    active = changes[0].name;
                 }
             }
             return (active && String(active).trim()) || null;
@@ -745,46 +817,154 @@ const RbMegaChain = (function () {
         // Recheck schedule: front-loaded so we catch the highway tone-base
         // publication as soon as it lands (most of the time inside the
         // first second), without giving up too early if the WS feed lags.
-        const recheckSchedule = [100, 200, 400, 700, 1000, 1500, 2000, 2700, 3500, 4500, 5500];
+        // Helper: have we received ANY tone metadata from the highway?
+        // True iff either a non-empty base or at least one tone change
+        // has been published. Used by the early "no-schedule" detector
+        // below to distinguish 'song genuinely has no tone-switching'
+        // (PSARC didn't pack any) from 'highway still publishing'.
+        const _highwayHasAnyToneData = () => {
+            try {
+                const hw = window.highway;
+                if (!hw) return false;
+                const base = hw.getToneBase ? hw.getToneBase() : '';
+                const changes = hw.getToneChanges ? hw.getToneChanges() : [];
+                return !!(
+                    (base && String(base).trim())
+                    || (Array.isArray(changes) && changes.length > 0)
+                );
+            } catch (_) { return false; }
+        };
+
+        // Schedule extended to 10 s (was 6 s) — gives slow highway WS
+        // publishes time to arrive before we commit to the heuristic
+        // fallback. Each tick first tries the strict resolver, then
+        // (on later ticks) the relaxed resolver that accepts the first
+        // scheduled tone-change as the intro when no base is published.
+        const recheckSchedule = [
+            100, 200, 400, 700, 1000, 1500, 2000, 2700, 3500, 4500, 5500,
+            6500, 7500, 8500, 9500,
+        ];
         recheckSchedule.forEach((delay, i) => {
             setTimeout(() => {
                 if (!_active || !_mega) return;
-                const key = _resolveActiveToneKey();
+                // First 4 rechecks: strict mode. After 700 ms, accept
+                // first-change-as-base too so songs with missing
+                // toneBase metadata get their intro tone within 1 s
+                // instead of waiting for the 10 s heuristic fallback.
+                const allowFirstChange = delay > 700;
+                const key = _resolveActiveToneKey({
+                    useFirstChangeIfNoBase: allowFirstChange,
+                });
                 if (!key || key === _activeToneKey) return;
                 const tone = _findToneByKey(key);
                 if (!tone) return;
                 _applyActiveTone(tone.tone_key).then(() => {
-                    console.log(`[rig_builder mega-chain] initial-recheck #${i+1} (t+${delay}ms) → switched to "${tone.tone_key}"`);
+                    const src = allowFirstChange ? 'first-change-or-base' : 'base';
+                    console.log(`[rig_builder mega-chain] initial-recheck #${i+1} (t+${delay}ms, ${src}) → switched to "${tone.tone_key}"`);
                 }).catch(() => {});
             }, delay);
         });
-        // Last-chance fallback: if after 6 s the highway still hasn't
-        // given us a tone (broken WS, unmapped song, exotic arrangement),
-        // pick a guitar tone (or whatever's available) so the user isn't
-        // stuck in dead silence forever. Prefer GUITAR over BASS: the
-        // tones array's order comes from DB insertion (often alphabetical
-        // by tone_key) which sometimes lists bass tones first — e.g.
-        // Reptilia → tones[0] is "Reptilia_bass", which made the user
-        // hear a bass tone when they were playing guitar. The instrument
-        // hint we can extract is whether the tone_key looks bass-flavored.
+        // Helper: pick the song's default tone matched to the user's
+        // active arrangement. The bundle's highway exposes
+        // `getStringCount()` → 4 = bass, 6/7/8 = guitar, which is the
+        // authoritative signal for what the user is plucking right
+        // now. Picking the wrong family is the user-visible bug we're
+        // here to fix: a bass-playing user got a guitar tone applied
+        // 1.5 s into the song (overriding the bundle's correct intro)
+        // because the old heuristic blindly preferred non-bass tones.
+        //
+        // Strategy:
+        //   - 4 strings → pick a bass tone (filter to bass-flavored)
+        //   - 6+ strings → pick a guitar tone (filter out bass-flavored)
+        //   - unknown / no matching tone → fall back to tones[0]
+        const _pickDefaultTone = () => {
+            const all = (mega.tones || []);
+            if (!all.length) return null;
+            const isBassFlavored = t =>
+                /(^|_)bass(_|\b)/i.test(t.tone_key || '')
+                || (Array.isArray(t.chain) && t.chain.some(p => /^Bass_/i.test(p.rs_gear || '')));
+            let stringCount = 6;
+            try {
+                const hw = window.highway;
+                if (hw && typeof hw.getStringCount === 'function') {
+                    const n = hw.getStringCount();
+                    if (typeof n === 'number' && n > 0) stringCount = n;
+                }
+            } catch (_) {}
+            const wantBass = stringCount <= 4;
+            const preferred = wantBass
+                ? all.find(t => isBassFlavored(t))
+                : all.find(t => !isBassFlavored(t));
+            return preferred || all[0];
+        };
+
+        // Early no-schedule detector: most songs that hit the old
+        // "FALLBACK after 10s" warning DON'T have late-arriving tone
+        // metadata — they have NONE AT ALL. The PSARC was packed without
+        // a section→tone schedule, so the bundle's audio-engine logs
+        // 'Song has no rebuildable tone-switching — keeping current
+        // chain' and the highway never publishes either base or
+        // changes. Waiting the full 10 s for nothing is just dead air +
+        // a misleading warning. At t+1500 ms we check: if the highway
+        // STILL has zero data, treat it as a no-schedule song, pick the
+        // default tone immediately, and log an INFO line (not a
+        // warning) explaining the situation. Genuine slow-WS cases
+        // (rare) will have published *something* by 1.5 s — even an
+        // empty toneChanges array gets populated as soon as the parser
+        // runs.
+        setTimeout(() => {
+            if (!_active || !_mega) return;
+            if (_activeToneKey) return;     // a recheck already landed
+            if (_highwayHasAnyToneData()) return;  // schedule en route
+            const tone = _pickDefaultTone();
+            if (!tone) return;
+            _applyActiveTone(tone.tone_key).then(() => {
+                console.log(
+                    `[rig_builder mega-chain] no schedule in PSARC for this song — `
+                    + `applying default tone "${tone.tone_key}". `
+                    + `Single-tone behaviour (no mid-song switching) is by design.`);
+            }).catch(() => {});
+        }, 1500);
+
+        // Last-chance fallback: if after 10 s the highway still hasn't
+        // given us a tone (broken WS, unmapped song, truly exotic
+        // arrangement with no schedule at all), pick a guitar tone
+        // (or whatever's available) so the user isn't stuck in dead
+        // silence forever. Prefer GUITAR over BASS: the tones array's
+        // order comes from DB insertion (often alphabetical by tone_key)
+        // which sometimes lists bass tones first — e.g. Reptilia →
+        // tones[0] is "Reptilia_bass", which made the user hear a bass
+        // tone when they were playing guitar. The instrument hint we
+        // can extract is whether the tone_key looks bass-flavored.
         // Matches the strings nam_tone names bass tones with: "_bass",
         // "Bass_", or the gear referenced is in the Bass_* family.
         setTimeout(() => {
             if (!_active || !_mega) return;
             if (_activeToneKey) return;     // any recheck already landed
-            const all = (mega.tones || []);
-            if (!all.length) return;
-            const isBassFlavored = t =>
-                /(^|_)bass(_|\b)/i.test(t.tone_key || '')
-                || (Array.isArray(t.chain) && t.chain.some(p => /^Bass_/i.test(p.rs_gear || '')));
-            // Prefer a guitar tone, fall back to first available if all
-            // are bass-flavoured (rare — bass-only songs).
-            const fallback = all.find(t => !isBassFlavored(t)) || all[0];
+            // One more shot at the relaxed resolver before guessing —
+            // catches songs where the change schedule arrived between
+            // the last recheck (t+9500) and now (t+10000).
+            const lastShot = _resolveActiveToneKey({ useFirstChangeIfNoBase: true });
+            if (lastShot) {
+                const tone = _findToneByKey(lastShot);
+                if (tone) {
+                    _applyActiveTone(tone.tone_key).then(() => {
+                        console.log(`[rig_builder mega-chain] late base/first-change → "${tone.tone_key}"`);
+                    }).catch(() => {});
+                    return;
+                }
+            }
+            const fallback = _pickDefaultTone();
+            if (!fallback) return;
             _applyActiveTone(fallback.tone_key).then(() => {
-                const flavour = isBassFlavored(fallback) ? 'BASS (no guitar tones in this song)' : 'guitar';
-                console.warn(`[rig_builder mega-chain] FALLBACK after 6s: applying "${fallback.tone_key}" [${flavour}] — highway never published a tone base for this song`);
+                console.warn(
+                    `[rig_builder mega-chain] FALLBACK after 10s: applying `
+                    + `"${fallback.tone_key}" — highway never published a tone `
+                    + `base OR a tone change schedule, AND the early `
+                    + `no-schedule detector at t+1500ms didn't fire (so highway `
+                    + `looked like it might still be loading). Edge case.`);
             }).catch(() => {});
-        }, 6000);
+        }, 10000);
 
         _active = true;
         return true;
@@ -829,7 +1009,14 @@ const RbMegaChain = (function () {
         let lastKey = _activeToneKey;
         _pollHandle = setInterval(async () => {
             if (!_active || !_mega) return;
-            const key = _resolveActiveToneKey();
+            // Relaxed resolver: accepts first scheduled tone-change as
+            // intro when base is missing. Safe in steady-state polling
+            // because the resolver still walks all changes <= t first
+            // — useFirstChangeIfNoBase only kicks in when NO change has
+            // fired yet (i.e. we're before the song's first scheduled
+            // tone). After that, the regular "last change <= t" branch
+            // gives the right answer regardless.
+            const key = _resolveActiveToneKey({ useFirstChangeIfNoBase: true });
             if (!key || key === lastKey) return;
             const tone = _findToneByKey(key);
             if (!tone) return;
@@ -1597,6 +1784,34 @@ async function rbSuggestSaveOverride(rsGear) {
 
 // ── By song ────────────────────────────────────────────────────────
 
+// Show / hide of the song list panel above the editor. Hidden after a
+// song is opened so the editor takes the whole tab; reappears as soon
+// as the user touches the search box (focus or input).
+function rbHideSongList() {
+    const el = document.getElementById('rb-song-list');
+    if (el) el.classList.add('hidden');
+}
+
+function rbShowSongList() {
+    const el = document.getElementById('rb-song-list');
+    if (el) el.classList.remove('hidden');
+}
+
+// Called from the search input's oninput. Shows the list right away
+// (the user just started typing — they expect to see candidates) and
+// debounces an actual /list_songs hit so we don't spam the backend on
+// every keystroke. 250 ms is the sweet spot between "feels live" and
+// "doesn't fire 8 fetches for a single word".
+let _rbSongSearchDebounce = null;
+function rbOnSongSearchInput() {
+    rbShowSongList();
+    if (_rbSongSearchDebounce) clearTimeout(_rbSongSearchDebounce);
+    _rbSongSearchDebounce = setTimeout(() => {
+        _rbSongSearchDebounce = null;
+        rbListSongs();
+    }, 250);
+}
+
 async function rbListSongs() {
     const q = document.getElementById('rb-song-search').value.trim();
     const r = await fetch(`${RB_API}/list_songs?q=${encodeURIComponent(q)}`);
@@ -1681,14 +1896,26 @@ async function rbLoadSongTones(filename) {
     }
     rbState.songTones = data;
     rbSeedBypass(data);
+    // Fresh song = fresh selection (always start at tone 0, piece 0).
+    rbResetEditorState();
     try {
-        el.innerHTML = data.tones.map((t, idx) => rbRenderTone(t, idx, filename)).join('');
+        el.innerHTML = rbRenderSongEditor(data, filename);
     } catch (e) {
         // Never leave the panel stuck on "Loading…" if a render throws.
         console.error('[rig_builder] render of tones failed', e);
         el.innerHTML = `<p class="text-red-400">Error rendering tones: ${rbEsc(e.message)}</p>`;
         return;
     }
+    // Hide the song list now that we're inside a specific song. Typing
+    // in the search box (or focusing it) brings the list back.
+    rbHideSongList();
+    // Auto-scroll the editor into view so picking a song from the (long)
+    // song list doesn't leave the user staring at the same list — they
+    // expect to land in the editor immediately. requestAnimationFrame
+    // lets the layout settle before measuring.
+    requestAnimationFrame(() => {
+        try { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+    });
 
     // Auto-download trigger: if the user has an API key and any chain
     // piece is unassigned, kick off the song-scoped download flow.
@@ -1739,11 +1966,11 @@ async function rbAutoDownloadSong(filename, unmappedCount, container) {
             const stillBanner = banner.cloneNode(true);
             container.innerHTML = '';
             container.appendChild(stillBanner);
-            refreshed.tones.forEach((t, idx) => {
-                const wrap = document.createElement('div');
-                wrap.innerHTML = rbRenderTone(t, idx, filename);
-                container.appendChild(wrap.firstElementChild);
-            });
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rbRenderSongEditor(refreshed, filename);
+            // Append every top-level child the editor returned (it's a
+            // single root <div> for now, but be defensive).
+            while (wrap.firstChild) container.appendChild(wrap.firstChild);
         }
     } catch (e) {
         banner.innerHTML = `<p class="text-red-400">Auto-download error: ${rbEsc(e.message)}</p>`;
@@ -1785,98 +2012,268 @@ async function rbMaterializeFromCloud(filename, statusEl) {
     }
 }
 
-function rbRenderTone(tone, toneIdx, filename) {
-    const pieces = tone.chain.map((p, pIdx) => rbRenderPiece(p, toneIdx, pIdx)).join('');
-    // Badge that flags whether this chain has been edited (saved preset_pieces
-    // overriding PSARC) vs still the original PSARC default.
-    const sourceBadge = tone.chain_source === 'edited'
-        ? `<span class="text-[10px] text-purple-300/80 bg-purple-900/20 border border-purple-800/30 rounded px-1.5 py-0.5"
-                  title="This tone's chain has been edited from the PSARC default">✎ edited</span>`
-        : `<span class="text-[10px] text-gray-500" title="Untouched — pieces still match the PSARC's GearList">PSARC default</span>`;
+// ── Song editor v2: tone tabs + horizontal chain strip + detail panel ──
+//
+// The old layout stacked every tone vertically with each chain piece in
+// a 2-col grid. That was ~5 screens of scrolling for a song with 3
+// tones x 6 pieces, and every action button (Bypass, Swap, file upload,
+// VST edit, Suggest, etc.) lived ON the card → visual noise.
+//
+// v2 layout:
+//   ┌ Tone tabs (one per tone in the .psarc) ─────────────┐
+//   │ [Clean*] [Crunch ] [Lead]              ✎ edited     │
+//   ├ Chain strip (signal flow L→R, photo cards) ─────────┤
+//   │ ◀ [photo] [photo] [photo*] [photo] [photo] ▶       │
+//   ├ Detail editor (the SELECTED piece) ─────────────────┤
+//   │  big photo │ name • type                    [Bypass]│
+//   │            │ Gain: [clean][crunch][dist] ↺ auto     │
+//   │            │ 🔁 Swap…   ⬇ Replace file              │
+//   │            │ ⬅ position ➡   ✗ Remove                │
+//   │            │ Rocksmith knobs: Rate=50 …             │
+//   ├ Footer ─────────────────────────────────────────────┤
+//   │ ＋ Add piece                       ▶ Listen  💾 Save │
+//   └─────────────────────────────────────────────────────┘
+//
+// Photos come from RB_API/gear_photo/<rs_gear> served by routes.py
+// (Rocksmith art extracted via extract_gear_photos.py). Missing photos
+// fall back to a small text placeholder via onerror.
+//
+// Selection state lives on rbState.editor; it's cleared when a new
+// song is loaded so opening a different .psarc always starts on tone 0
+// piece 0.
+
+function rbEnsureEditorState() {
+    rbState.editor = rbState.editor || { selectedToneIdx: 0, selectedPIdx: 0 };
+    return rbState.editor;
+}
+
+function rbResetEditorState() {
+    rbState.editor = { selectedToneIdx: 0, selectedPIdx: 0 };
+}
+
+function rbRenderSongEditor(data, filename) {
+    const ed = rbEnsureEditorState();
+    if (!data || !Array.isArray(data.tones) || data.tones.length === 0) {
+        return '<p class="text-gray-500 text-sm">No tones in this song.</p>';
+    }
+    // Clamp selection so a chain shrink (remove piece) doesn't leave a
+    // dangling selected index that re-renders blank.
+    if (ed.selectedToneIdx >= data.tones.length) ed.selectedToneIdx = 0;
+    const tone = data.tones[ed.selectedToneIdx];
+    const chainLen = (tone.chain || []).length;
+    if (ed.selectedPIdx >= chainLen) ed.selectedPIdx = Math.max(0, chainLen - 1);
     return `
-        <div class="bg-dark-700/50 border border-gray-800/50 rounded-xl p-4">
-            <div class="flex items-baseline justify-between mb-3">
-                <h3 class="text-white font-semibold">${rbEsc(tone.name)}</h3>
-                <div class="flex items-center gap-2">
-                    ${sourceBadge}
-                    <span class="text-xs text-gray-500">${rbEsc(tone.key)}</span>
-                </div>
-            </div>
-            <div class="text-[10px] text-gray-500 mb-2">
-                Signal flow: ${tone.chain.length} stage${tone.chain.length === 1 ? '' : 's'} ·
-                drag through ▲ ▼ to reorder, ✗ to remove
-            </div>
-            <div id="rb-chain-${toneIdx}" class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">${pieces}</div>
-            <div class="flex justify-between items-center gap-2">
-                <button onclick="rbOpenAddPiecePicker(${toneIdx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
-                        title="Insert a new gear at the end of this tone's chain"
-                        class="bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-300 border border-emerald-800/40 px-3 py-1.5 rounded text-xs transition">
-                    ＋ Add piece to chain
-                </button>
-                <div class="flex gap-2">
-                    <button id="rb-listen-${toneIdx}"
-                            onclick="rbListenTone(${toneIdx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
-                            title="Saves the tone and plays it live through the NAM engine (monitors your guitar input)"
-                            class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-4 py-2 rounded-lg text-xs transition">
-                        ▶ Listen
-                    </button>
-                    <button onclick="rbSaveTonePreset(${toneIdx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
-                            class="bg-accent hover:bg-accent/80 text-white px-4 py-2 rounded-lg text-xs transition">
-                        Save preset
-                    </button>
-                </div>
-            </div>
-            <div id="rb-addpiece-modal-${toneIdx}" class="hidden mt-3 bg-emerald-900/10 border border-emerald-800/30 rounded p-3"></div>
+        <div class="bg-dark-700/40 border border-gray-800/50 rounded-xl overflow-hidden">
+            ${rbRenderToneTabs(data.tones, ed.selectedToneIdx, filename)}
+            ${rbRenderToneHeader(tone, ed.selectedToneIdx, filename)}
+            ${rbRenderChainStrip(tone, ed.selectedToneIdx, ed.selectedPIdx)}
+            <div id="rb-detail-panel">${
+                chainLen > 0
+                    ? rbRenderPieceEditor(tone.chain[ed.selectedPIdx], ed.selectedToneIdx, ed.selectedPIdx, filename)
+                    : '<p class="text-gray-500 text-sm p-4">No pieces in this tone. Add one below.</p>'
+            }</div>
+            ${rbRenderEditorFooter(ed.selectedToneIdx, filename)}
+            <div id="rb-addpiece-modal-${ed.selectedToneIdx}" class="hidden m-3 bg-emerald-900/10 border border-emerald-800/30 rounded p-3"></div>
         </div>`;
 }
 
-// Re-render JUST the chain grid for one tone after a reorder / add / remove
-// (avoids a full song refetch). Position numbers, slot badges, and the
-// chain-length copy all come from the live tone.chain so it's enough to
-// rebuild the inner grid.
-function rbReRenderToneChain(toneIdx, filename) {
-    const tone = rbState.songTones.tones[toneIdx];
-    if (!tone) return;
-    const grid = document.getElementById(`rb-chain-${toneIdx}`);
-    if (grid) {
-        grid.innerHTML = tone.chain.map((p, pIdx) => rbRenderPiece(p, toneIdx, pIdx)).join('');
-    }
-    // Update the stages count copy too.
-    const headerCopy = grid?.previousElementSibling;
-    if (headerCopy) {
-        headerCopy.innerHTML = `Signal flow: ${tone.chain.length} stage${tone.chain.length === 1 ? '' : 's'} · drag through ▲ ▼ to reorder, ✗ to remove`;
-    }
+function rbRenderToneTabs(tones, selectedIdx, filename) {
+    const tabs = tones.map((t, idx) => {
+        const active = idx === selectedIdx;
+        const cls = active
+            ? 'bg-accent text-white border-accent'
+            : 'bg-dark-800 text-gray-400 border-gray-800 hover:bg-dark-700 hover:text-gray-200';
+        // Small visual signal for edited/PSARC-default and a piece count.
+        const pieces = (t.chain || []).length;
+        const editedMark = t.chain_source === 'edited' ? ' ✎' : '';
+        return `<button onclick="rbSelectTone(${idx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
+                        title="${rbEsc(t.key)} · ${pieces} piece${pieces === 1 ? '' : 's'}"
+                        class="flex-shrink-0 px-3 py-2 rounded-lg border text-xs transition ${cls}">
+                    ${rbEsc(t.name)}${editedMark}
+                    <span class="ml-1 text-[10px] opacity-70">${pieces}</span>
+                </button>`;
+    }).join('');
+    return `<div class="flex items-center gap-1 overflow-x-auto px-3 pt-3 pb-2 border-b border-gray-800/40"
+                 style="scrollbar-width: thin;">
+                ${tabs}
+            </div>`;
 }
 
-function rbRenderPiece(p, toneIdx, pIdx) {
+function rbRenderToneHeader(tone, toneIdx, filename) {
+    const editedBadge = tone.chain_source === 'edited'
+        ? `<span class="text-[10px] text-purple-300/80 bg-purple-900/20 border border-purple-800/30 rounded px-1.5 py-0.5"
+                title="This tone's chain has been edited from the PSARC default">✎ edited</span>`
+        : `<span class="text-[10px] text-gray-500" title="Untouched — matches the PSARC's original GearList">PSARC default</span>`;
+    return `
+        <div class="flex items-baseline justify-between px-4 py-3">
+            <div class="flex items-baseline gap-2 min-w-0">
+                <h3 class="text-white font-semibold truncate">${rbEsc(tone.name)}</h3>
+                <span class="text-xs text-gray-500 truncate">${rbEsc(tone.key)}</span>
+            </div>
+            ${editedBadge}
+        </div>`;
+}
+
+function rbRenderChainStrip(tone, toneIdx, selectedPIdx) {
+    const chain = tone.chain || [];
+    const total = chain.length;
+    const filename = rbState.currentSongFile || '';
+    // Build the strip piece-by-piece so we can interleave:
+    //   ◀  (only on the LEFT side of the selected card, if not first)
+    //   card
+    //   ▶  (only on the RIGHT side of the selected card, if not last)
+    //   →  (signal-flow arrow between adjacent cards)
+    //   ＋ (always at the very end — adds a new piece)
+    const parts = [];
+    chain.forEach((p, pIdx) => {
+        const isSelected = pIdx === selectedPIdx;
+        const prevSelected = (pIdx > 0 && selectedPIdx === pIdx - 1);
+        const isFirst = pIdx === 0;
+        const isLast = pIdx === total - 1;
+        // What goes IN FRONT of this card:
+        //   - ◀ button if THIS card is the selected one (and not first)
+        //   - nothing if the PREVIOUS card was selected (its ▶ button
+        //     already sits in that slot)
+        //   - → otherwise (the normal signal-flow arrow between
+        //     adjacent stages)
+        if (pIdx > 0) {
+            if (isSelected && !isFirst) {
+                parts.push(`<button onclick="event.stopPropagation(); rbMovePiece(${toneIdx}, ${pIdx}, -1)"
+                                    title="Move this piece earlier in the chain"
+                                    class="flex-shrink-0 self-stretch w-7 rounded-md bg-dark-700 hover:bg-accent/30 text-gray-300 hover:text-white text-sm transition flex items-center justify-center">◀</button>`);
+            } else if (!prevSelected) {
+                parts.push('<div class="flex-shrink-0 flex items-center text-gray-700 text-lg select-none" aria-hidden="true">→</div>');
+            }
+        }
+        parts.push(rbRenderPieceCard(p, toneIdx, pIdx, isSelected, total));
+        // ▶ Move-right button glued to the selected card's right side
+        // (so visually the selected card always wears its reorder
+        // controls on either flank).
+        if (isSelected && !isLast) {
+            parts.push(`<button onclick="event.stopPropagation(); rbMovePiece(${toneIdx}, ${pIdx}, 1)"
+                                title="Move this piece later in the chain"
+                                class="flex-shrink-0 self-stretch w-7 rounded-md bg-dark-700 hover:bg-accent/30 text-gray-300 hover:text-white text-sm transition flex items-center justify-center">▶</button>`);
+        }
+    });
+    // ＋ Add-piece dropzone at the end of the chain — replaces the old
+    // footer button so the "insert a new gear" affordance lives where
+    // the user's eye already is (in the signal flow itself).
+    parts.push(`<button onclick="rbOpenAddPiecePicker(${toneIdx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
+                        title="Insert a new gear at the end of this tone's chain"
+                        class="flex-shrink-0 w-16 self-stretch rounded-lg border-2 border-dashed border-emerald-800/40 hover:border-emerald-500 hover:bg-emerald-900/20 text-emerald-400 text-2xl transition flex items-center justify-center"
+                        aria-label="Add piece to chain">＋</button>`);
+    return `
+        <div class="px-3 pb-3">
+            <div class="text-[10px] text-gray-500 mb-1.5">
+                Signal flow (${total} stage${total === 1 ? '' : 's'}, L → R) — click a piece to edit · ◀ ▶ to reorder the selected one · ＋ to add.
+            </div>
+            <div id="rb-chain-${toneIdx}"
+                 class="flex items-stretch gap-2 overflow-x-auto pb-2"
+                 style="scrollbar-width: thin;">
+                ${parts.join('') || '<div class="text-xs text-gray-600 italic">empty chain</div>'}
+            </div>
+        </div>`;
+}
+
+function rbRenderPieceCard(p, toneIdx, pIdx, isSelected, total) {
+    const bypassed = !!p._bypassed;
+    // Effective assignment — drives the status dot colour.
+    const hasVst = (p._vst_kind === 'vst' || (p.assigned && p.assigned.kind === 'vst' && p.assigned.vst_path));
+    const hasFile = !hasVst && !!(p._uploaded_file || (p.assigned && p.assigned.file));
+    // Status dot at the top-right. When bypassed, the dot "turns off":
+    // a small ringed gray pip mirroring the unassigned style, so the
+    // user knows the stage is dark even when it's still wired up.
+    let dotColor, dotTitle;
+    if (bypassed) {
+        dotColor = 'bg-gray-800 ring-1 ring-gray-700';
+        dotTitle = 'Bypassed — stage skipped (signal passes through)';
+    } else if (hasVst) {
+        dotColor = 'bg-purple-400';
+        dotTitle = 'VST plugin loaded';
+    } else if (hasFile) {
+        dotColor = 'bg-green-400';
+        dotTitle = 'NAM/IR assigned';
+    } else {
+        dotColor = 'bg-gray-600 ring-1 ring-gray-700';
+        dotTitle = 'Unassigned';
+    }
+    const statusDot = `<span class="absolute top-1 right-1 w-2 h-2 rounded-full ${dotColor}" title="${rbEsc(dotTitle)}"></span>`;
+    const selCls = isSelected
+        ? 'border-accent ring-2 ring-accent/40 bg-dark-700'
+        : 'border-gray-800 hover:border-gray-600 bg-dark-800/70';
+    // When bypassed, drop the photo to grayscale + dim it so the card
+    // visually reads as "off" — pairs nicely with the dimmed status dot.
+    const imgBypassCls = bypassed ? 'grayscale opacity-40' : '';
+    // Photo lookup: backend returns 404 when no Rocksmith art exists for
+    // this rs_gear. The onerror swaps the broken <img> for the sibling
+    // placeholder via plain DOM properties — avoids HTML-in-attribute
+    // escaping bugs.
+    const imgUrl = `${RB_API}/gear_photo/${encodeURIComponent(p.type)}${_RB_GEAR_PHOTO_CB}`;
+    const onerr = "this.style.display='none'; var n=this.nextElementSibling; if(n) n.classList.remove('hidden');";
+    return `
+        <button onclick="rbSelectPiece(${toneIdx}, ${pIdx})"
+                class="relative flex-shrink-0 w-28 rounded-lg border ${selCls} p-2 text-left transition focus:outline-none">
+            <div class="text-[9px] text-gray-500 mb-1 flex items-center justify-between">
+                <span class="font-mono">${pIdx + 1}/${total}</span>
+                <span class="uppercase tracking-wide">${rbEsc(p.rs_category || '')}</span>
+            </div>
+            <div class="flex justify-center items-center mb-1.5 h-20">
+                <img src="${imgUrl}" alt="" loading="lazy"
+                     class="max-w-full max-h-full rounded object-contain bg-dark-900 transition ${imgBypassCls}"
+                     onerror="${onerr}">
+                <div class="hidden w-full h-full rounded bg-dark-900 flex items-center justify-center text-[10px] text-gray-600 text-center px-1 leading-tight ${imgBypassCls}">
+                    ${rbEsc(p.rs_category || 'gear')}
+                </div>
+            </div>
+            <div class="text-[11px] ${bypassed ? 'text-gray-500' : 'text-gray-200'} leading-tight line-clamp-2 min-h-[2.2em]" title="${rbEsc(p.real_name || p.type)}">
+                ${rbEsc(p.real_name || p.type)}
+            </div>
+            ${statusDot}
+        </button>`;
+}
+
+function rbRenderEditorFooter(toneIdx, filename) {
+    // The "＋ Add piece" button used to live here, but it moved to the
+    // tail of the chain strip (rbRenderChainStrip) so the affordance
+    // sits where the user is already looking when planning the signal
+    // flow. The footer is now just the playback controls.
+    return `
+        <div class="flex flex-wrap justify-end items-center gap-2 px-4 py-3 border-t border-gray-800/40 bg-dark-800/30">
+            <button id="rb-listen-${toneIdx}"
+                    onclick="rbListenTone(${toneIdx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
+                    title="Saves the tone and plays it live through the NAM engine"
+                    class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-4 py-1.5 rounded-lg text-xs transition">
+                ▶ Listen
+            </button>
+            <button onclick="rbSaveTonePreset(${toneIdx}, '${rbEsc(filename).replace(/'/g,"\\'")}')"
+                    class="bg-accent hover:bg-accent/80 text-white px-4 py-1.5 rounded-lg text-xs transition">
+                💾 Save preset
+            </button>
+        </div>`;
+}
+
+function rbRenderPieceEditor(p, toneIdx, pIdx, filename) {
+    // NAM / IR uploads and Library picks happen exclusively from the
+    // All Gear tab now — they're catalog-level operations, not
+    // per-song. The song editor only deals with chain-level decisions
+    // (variant override, gear swap, reorder, bypass, VST params).
     const isCab = p.rs_category === 'cab';
-    const acceptExt = isCab ? '.wav' : '.nam';
-    // Resolve the *effective* current assignment, preferring in-memory
-    // pending changes over what's persisted in the DB. A piece can be:
-    //   - VST   (kind=vst, vst_path set)
-    //   - NAM   (kind=nam, file set)
-    //   - IR    (kind=ir|rs_ir, file set)
-    //   - empty (unassigned)
     const pendingKind = p._uploaded_kind || p._vst_kind;
     const assignedKind = p.assigned && p.assigned.kind;
-    const effKind = pendingKind || assignedKind || (p.rs_category === 'cab' ? 'ir' : 'nam');
+    const effKind = pendingKind || assignedKind || (isCab ? 'ir' : 'nam');
     const effVstPath = p._vst_path || (p.assigned && p.assigned.vst_path) || '';
     const effVstFormat = p._vst_format || (p.assigned && p.assigned.vst_format) || 'VST3';
     const effFile = p._uploaded_file || (p.assigned && p.assigned.file) || null;
     const hasVst = effKind === 'vst' && !!effVstPath;
     const hasFile = !hasVst && !!effFile;
     const mode = (p.assigned && p.assigned.assigned_mode) || (p._uploaded_file ? 'manual' : '');
+    const bypassed = !!p._bypassed;
+
     let stageLabel, stageClass;
     if (hasVst) {
-        // Show just the filename of the VST bundle (e.g. "TAL-Chorus-LX.vst3"),
-        // not the absolute path.
-        const vstName = effVstPath.split('/').pop();
-        stageLabel = `✓ VST: ${vstName}`;
+        stageLabel = `✓ VST: ${effVstPath.split('/').pop()}`;
         stageClass = 'text-purple-300';
     } else if (hasFile) {
-        // Prefer the human tone3000 title over the technical
-        // tone3000_<id>_m<model>_<rs_gear> filename, but only when we're
-        // showing the assigned capture (a manual upload keeps its filename).
         const a = p.assigned;
         const title = (!p._uploaded_file && a && a.file === effFile && a.tone3000_title) ? a.tone3000_title : '';
         stageLabel = `✓ ${title || rbLibShortName(effFile)}`;
@@ -1885,17 +2282,43 @@ function rbRenderPiece(p, toneIdx, pIdx) {
         stageLabel = '(unassigned)';
         stageClass = 'text-gray-500';
     }
-    const bypassed = !!p._bypassed;
 
-    // For cab pieces we may have one or more Rocksmith-extracted IRs
-    // available locally (no download needed). When present, surface a
-    // one-click select with a dropdown for the mic-position variants.
-    const rsIrs = p.rs_irs || [];
+    // Cab mic-position picker — clickable buttons per mic resolved
+    // from rs_cab_mic_map (Dynamic Cone, Condenser Edge, Tube Off-axis,
+    // …). Falls back to the legacy "Rocksmith IR (N):" filename dropdown
+    // for cabs whose mic_variants the extractor couldn't resolve
+    // (e.g. the user hasn't re-run extract_irs since we added the map).
     let rsIrControl = '';
-    if (rsIrs.length > 0) {
-        const options = rsIrs.map((f, i) => `<option value="${rbEsc(f)}">${rbEsc(f.split('/').pop())}</option>`).join('');
+    const micVariants = p.cab_mic_variants || [];
+    if (micVariants.length > 0) {
+        const activeFile = effFile;
+        const btns = micVariants.map(v => {
+            const active = v.ir_file === activeFile;
+            if (!v.available || !v.ir_file) {
+                return `<button disabled title="IR not extracted"
+                                class="px-2.5 py-0.5 rounded border text-[11px] bg-dark-800/40 text-gray-600 border-gray-800 cursor-not-allowed">${rbEsc(v.label || v.suffix)}</button>`;
+            }
+            const cls = active
+                ? 'bg-sky-700/60 text-sky-100 border-sky-500/60 font-semibold'
+                : 'bg-dark-800 text-gray-300 border-gray-700 hover:bg-sky-900/40 hover:text-sky-200 hover:border-sky-700/40';
+            return `<button onclick="rbPickCabMic(${toneIdx}, ${pIdx}, '${rbEsc(v.ir_file).replace(/'/g,"\\'")}')"
+                            title="${rbEsc(v.mic_type || '')} · ${rbEsc(v.position || '')} (suffix ${rbEsc(v.suffix)})"
+                            class="px-2.5 py-0.5 rounded border text-[11px] transition ${cls}">${rbEsc(v.label || v.suffix)}</button>`;
+        }).join(' ');
         rsIrControl = `
-            <div class="flex items-center gap-2 mt-2 bg-green-900/15 border border-green-800/30 rounded px-2 py-1.5">
+            <div class="bg-sky-900/15 border border-sky-800/30 rounded p-2.5 mt-2">
+                <div class="flex items-center gap-2 mb-1.5">
+                    <span class="text-xs text-sky-400">🎙 Mic position</span>
+                    <span class="text-[10px] text-gray-500">Rocksmith-extracted IRs — click to switch</span>
+                </div>
+                <div class="flex items-center gap-1.5 flex-wrap">${btns}</div>
+            </div>`;
+    } else if ((p.rs_irs || []).length > 0) {
+        // Legacy fallback: raw dropdown for cabs without a mic map.
+        const rsIrs = p.rs_irs;
+        const options = rsIrs.map(f => `<option value="${rbEsc(f)}">${rbEsc(f.split('/').pop())}</option>`).join('');
+        rsIrControl = `
+            <div class="flex items-center gap-2 bg-green-900/15 border border-green-800/30 rounded px-2 py-1.5 mt-2">
                 <span class="text-xs text-green-400 whitespace-nowrap">Rocksmith IR (${rsIrs.length}):</span>
                 <select onchange="rbPickRsIr(this, ${toneIdx}, ${pIdx})"
                         class="flex-1 bg-dark-800 border border-gray-800 rounded text-xs text-gray-300 px-1 py-0.5">${options}</select>
@@ -1904,34 +2327,36 @@ function rbRenderPiece(p, toneIdx, pIdx) {
             </div>`;
     }
 
-    // Amp gain variant badge: only present when the curator has shipped
-    // `gain_variants` for this amp in rs_to_real.json. Shows which level
-    // (clean / crunch / dist / whatever the curator named it) the system
-    // auto-picked based on the song's Gain knob value. Read-only: to
-    // switch to another variant the user picks a different NAM file via
-    // 📚 Library or the file input — the existing manual flow already
-    // covers the override case without us needing a separate UI.
+    // Amp gain variant picker — clickable buttons, active level highlighted.
     let ampVariantBadge = '';
-    if (p.amp_variant && p.amp_variant.picked) {
+    if (p.amp_variant && Array.isArray(p.amp_variant.available) && p.amp_variant.available.length) {
         const av = p.amp_variant;
-        const availList = (av.available || []).map(level =>
-            level === av.picked
-                ? `<span class="text-emerald-300 font-semibold">${rbEsc(level)}</span>`
-                : `<span class="text-gray-500">${rbEsc(level)}</span>`
-        ).join(' · ');
+        const activeLevel = av.current_level || av.picked;
+        const manualMode = (p.assigned && p.assigned.assigned_mode === 'manual');
+        const overrideActive = manualMode && av.current_level && av.current_level !== av.picked;
+        const btns = (av.available || []).map(level => {
+            const active = level === activeLevel;
+            const cls = active
+                ? 'bg-emerald-700/60 text-emerald-100 border-emerald-500/60 font-semibold'
+                : 'bg-dark-800 text-gray-300 border-gray-700 hover:bg-emerald-900/40 hover:text-emerald-200 hover:border-emerald-700/40';
+            return `<button onclick="rbPickVariant(${toneIdx}, ${pIdx}, '${rbEsc(level)}')"
+                            title="Force this gain variant for this song"
+                            class="px-3 py-1 rounded border text-xs transition ${cls}">${rbEsc(level)}</button>`;
+        }).join(' ');
+        const autoBtn = `<button onclick="rbPickVariant(${toneIdx}, ${pIdx}, 'auto')"
+                                 title="Restore the auto-pick based on the song's Gain knob"
+                                 class="px-3 py-1 rounded border text-xs transition ${overrideActive ? 'bg-dark-800 text-gray-400 border-gray-700 hover:bg-emerald-900/30' : 'bg-emerald-700/40 text-emerald-200 border-emerald-600/40'}">↺ auto</button>`;
         ampVariantBadge = `
-            <div class="mt-2 bg-emerald-900/15 border border-emerald-800/30 rounded px-2 py-1.5 text-[11px] leading-snug"
-                 title="Multi-NAM amp: the system auto-picks the variant whose gain range matches this tone's Gain knob (=${rbEsc(av.rs_gain)}). To use a different variant, swap the NAM file via 📚 Library below.">
-                <span class="text-emerald-400">🎛 Amp gain variant:</span>
-                <span class="text-emerald-200">${availList}</span>
-                <span class="text-gray-500 ml-1">· auto from Gain=${rbEsc(av.rs_gain)}</span>
+            <div class="bg-emerald-900/15 border border-emerald-800/30 rounded p-2.5 mt-2">
+                <div class="flex items-center gap-2 mb-1.5">
+                    <span class="text-xs text-emerald-400">🎛 Gain variant</span>
+                    <span class="text-[10px] text-gray-500">${overrideActive ? `manual override (auto would be ${rbEsc(av.picked || '?')})` : `auto from RS Gain knob = ${rbEsc(av.rs_gain)}`}</span>
+                </div>
+                <div class="flex items-center gap-1.5 flex-wrap">${btns} ${autoBtn}</div>
             </div>`;
     }
 
-    // Rocksmith knob configuration for this piece — the values the in-game
-    // tone uses for this gear (e.g. Pedal_Chorus20 with Rate=50 Depth=30 Mix=70).
-    // Shown read-only so the user can either replicate manually in the VST
-    // editor or click "Apply RS settings" when a translation table exists.
+    // RS knob badges — read-only summary of Rocksmith's per-piece values.
     const rsKnobs = p.knobs || {};
     const knobNames = Object.keys(rsKnobs);
     let rsKnobsBlock = '';
@@ -1942,76 +2367,129 @@ function rbRenderPiece(p, toneIdx, pIdx) {
             return `<span class="inline-block bg-dark-900/60 border border-gray-800/50 rounded px-1.5 py-0.5 text-[10px] text-gray-300 mr-1 mb-1"><span class="text-gray-500">${rbEsc(k)}</span> <span class="text-amber-300">${rbEsc(display)}</span></span>`;
         }).join('');
         rsKnobsBlock = `
-            <div class="mt-2 pt-2 border-t border-gray-800/40">
-                <div class="text-[10px] text-gray-500 mb-1">Rocksmith settings:</div>
+            <div class="bg-dark-900/30 border border-gray-800/40 rounded p-2.5 mt-2">
+                <div class="text-[10px] text-gray-500 mb-1.5">Rocksmith knob values (read-only)</div>
                 <div class="flex flex-wrap">${pairs}</div>
             </div>`;
     }
 
-    // Chain editor controls (auto-save on click): position number + ▲ ▼ ✗
-    const total = (rbState.songTones && rbState.songTones.tones[toneIdx] && rbState.songTones.tones[toneIdx].chain.length) || 1;
-    const isFirst = pIdx === 0;
-    const isLast  = pIdx === total - 1;
+    // Bypass button — same toggle as before, styled larger for the editor.
+    const bypassCls = bypassed
+        ? 'bg-amber-700/40 text-amber-300 border-amber-600/40'
+        : 'bg-dark-700 hover:bg-dark-600 text-gray-300 border-gray-700';
+    const bypassLabel = bypassed ? '⤳ Bypassed (signal passes through)' : 'Bypass this stage';
+
+    // Big photo for the editor (same source as the chain cards).
+    // Same sibling-swap pattern as rbRenderPieceCard — see comment there
+    // for why we avoid the `JSON.stringify` inside an attribute approach.
+    const imgUrl = `${RB_API}/gear_photo/${encodeURIComponent(p.type)}${_RB_GEAR_PHOTO_CB}`;
+    const onerrBig = "this.style.display='none'; var n=this.nextElementSibling; if(n) n.classList.remove('hidden');";
+
     return `
-        <div class="bg-dark-800 border border-gray-800/50 rounded-lg p-3" data-tone="${toneIdx}" data-piece="${pIdx}">
-            <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center gap-2 min-w-0">
-                    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-dark-900 border border-gray-700 text-[11px] text-gray-300 flex items-center justify-center font-mono"
-                          title="Position in the signal flow (1 = first, N = last before output)">${pIdx + 1}</span>
-                    <div class="min-w-0">
-                        <div class="text-sm text-gray-200 truncate">${rbEsc(p.real_name || p.type)}</div>
-                        <div class="text-xs text-gray-500 truncate">
-                            ${rbEsc(p.slot)} · ${rbEsc(p.rs_category)} · ${rbEsc(p.type)}
-                        </div>
+        <div class="bg-dark-800/40 border-y border-gray-800/40 p-4 space-y-3" data-tone="${toneIdx}" data-piece="${pIdx}">
+            <div class="flex items-start gap-4">
+                <div class="flex-shrink-0 w-32 h-32 flex items-center justify-center">
+                    <img src="${imgUrl}" alt="" loading="lazy"
+                         class="max-w-full max-h-full rounded object-contain bg-dark-900"
+                         onerror="${onerrBig}">
+                    <div class="hidden w-full h-full rounded bg-dark-900 flex items-center justify-center text-xs text-gray-600 text-center px-2">
+                        ${rbEsc(p.rs_category || 'gear')}
                     </div>
                 </div>
-                <div class="flex items-center gap-1 flex-shrink-0">
-                    <button onclick="rbMovePiece(${toneIdx}, ${pIdx}, -1)"
-                            title="Move earlier in the signal flow"
-                            ${isFirst ? 'disabled' : ''}
-                            class="px-1.5 py-1 rounded text-xs transition ${isFirst ? 'bg-dark-700/40 text-gray-700 cursor-not-allowed' : 'bg-dark-600 hover:bg-dark-500 text-gray-300'}">▲</button>
-                    <button onclick="rbMovePiece(${toneIdx}, ${pIdx}, 1)"
-                            title="Move later in the signal flow"
-                            ${isLast ? 'disabled' : ''}
-                            class="px-1.5 py-1 rounded text-xs transition ${isLast ? 'bg-dark-700/40 text-gray-700 cursor-not-allowed' : 'bg-dark-600 hover:bg-dark-500 text-gray-300'}">▼</button>
-                    <button onclick="rbRemovePiece(${toneIdx}, ${pIdx})"
-                            title="Remove this piece from the chain (the rs_to_real entry stays — you can re-add later)"
-                            class="px-1.5 py-1 rounded text-xs bg-red-900/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 transition">✗</button>
-                    <button id="rb-bypass-${toneIdx}-${pIdx}" onclick="rbToggleBypass(${toneIdx}, ${pIdx}, this)"
-                            title="Bypass: skips this stage in the preview (signal passes through unprocessed — it isn't muted, the chain keeps working)"
-                            class="px-2 py-1 rounded text-xs transition ${bypassed ? 'bg-amber-700/40 text-amber-300 border border-amber-600/40' : 'bg-dark-600 hover:bg-dark-500 text-gray-300'}">
-                        ${bypassed ? '⤳ Bypassed' : 'Bypass'}
-                    </button>
-                    <button onclick="rbOpenSuggest('${rbEsc(p.type)}')"
-                            class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-2 py-1 rounded text-xs transition">
-                        Suggest
-                    </button>
+                <div class="min-w-0 flex-1">
+                    <div class="flex items-baseline justify-between gap-2 mb-1">
+                        <div class="min-w-0">
+                            <div class="text-base text-gray-100 font-medium truncate">${rbEsc(p.real_name || p.type)}</div>
+                            <div class="text-xs text-gray-500 truncate">
+                                #${pIdx + 1} · ${rbEsc(p.slot)} · ${rbEsc(p.rs_category)}
+                                <span class="text-gray-600">·</span>
+                                <code class="text-gray-500">${rbEsc(p.type)}</code>
+                            </div>
+                        </div>
+                        <button id="rb-bypass-${toneIdx}-${pIdx}"
+                                onclick="rbToggleBypass(${toneIdx}, ${pIdx}, this)"
+                                title="Bypass skips this stage in the preview (signal passes through unprocessed)"
+                                class="flex-shrink-0 px-3 py-1.5 rounded border text-xs transition ${bypassCls}">
+                            ${rbEsc(bypassLabel)}
+                        </button>
+                    </div>
+                    <div class="text-xs ${stageClass} truncate" title="${rbEsc(hasVst ? effVstPath : (hasFile ? effFile : ''))}">${rbEsc(stageLabel)}
+                        ${(hasFile || hasVst) && mode ? `<span class="text-[10px] text-gray-600 ml-1">(${rbEsc(mode)})</span>` : ''}
+                    </div>
                 </div>
             </div>
-            <div class="flex items-center gap-2">
-                <input type="file" accept="${acceptExt}"
-                       onchange="rbUploadFile(this, ${toneIdx}, ${pIdx})"
-                       class="text-xs text-gray-500 file:bg-dark-700 file:border-0 file:text-gray-300 file:px-2 file:py-1 file:rounded file:text-xs file:cursor-pointer">
-                <button onclick="rbToggleLibraryPicker(${toneIdx}, ${pIdx})"
-                        title="Pick from your downloaded ${isCab ? 'IRs' : 'NAMs'}"
-                        class="bg-indigo-900/30 hover:bg-indigo-900/50 text-indigo-300 border border-indigo-800/40 px-2 py-1 rounded text-xs">
-                    📚 Library
+
+            ${ampVariantBadge}
+
+            <div class="flex flex-wrap items-center gap-2">
+                <button onclick="rbToggleGearSwap(${toneIdx}, ${pIdx})"
+                        title="Swap this ${rbEsc(p.rs_category)} for a different one — just for this song"
+                        class="bg-amber-900/25 hover:bg-amber-900/45 text-amber-300 border border-amber-800/40 px-3 py-1.5 rounded text-xs">
+                    🔁 Swap…
                 </button>
                 ${hasVst ? `
                 <button onclick="rbToneEditVst(${toneIdx}, ${pIdx})"
                         title="Load this VST in the engine and edit its parameters with inline sliders"
-                        class="bg-purple-900/30 hover:bg-purple-900/50 text-purple-300 border border-purple-800/40 px-2 py-1 rounded text-xs">
+                        class="bg-purple-900/30 hover:bg-purple-900/50 text-purple-300 border border-purple-800/40 px-3 py-1.5 rounded text-xs">
                     🎛 Edit VST
                 </button>` : ''}
-                <span class="rb-piece-file text-xs ${stageClass} truncate" title="${rbEsc(hasVst ? effVstPath : (hasFile ? effFile : ''))}">${rbEsc(stageLabel)}</span>
-                ${(hasFile || hasVst) && mode ? `<span class="text-[10px] text-gray-600 whitespace-nowrap">(${rbEsc(mode)})</span>` : ''}
+                <div class="flex-1"></div>
+                <button onclick="rbRemovePiece(${toneIdx}, ${pIdx})"
+                        title="Remove this piece from the chain"
+                        class="px-2 py-1 rounded text-xs bg-red-900/30 hover:bg-red-900/50 text-red-300 border border-red-800/40 transition">✗ Remove</button>
             </div>
-            <div id="rb-lib-${toneIdx}-${pIdx}" class="hidden mt-2 bg-indigo-900/10 border border-indigo-800/30 rounded p-2"></div>
-            <div id="rb-tone-vst-editor-${toneIdx}-${pIdx}" class="hidden mt-2 bg-purple-900/10 border border-purple-800/30 rounded p-2 space-y-2"></div>
-            ${ampVariantBadge}
+
+            <div id="rb-swap-${toneIdx}-${pIdx}" class="hidden bg-amber-900/10 border border-amber-800/30 rounded p-2"></div>
+            <div id="rb-tone-vst-editor-${toneIdx}-${pIdx}" class="hidden bg-purple-900/10 border border-purple-800/30 rounded p-2 space-y-2"></div>
+
             ${rsKnobsBlock}
             ${rsIrControl}
         </div>`;
+}
+
+// Click handler for tone tabs at the top. Resets the piece selection to
+// 0 so the user always lands on the first stage of the new tone (which
+// is usually the most-recently-swapped — the amp is rarely at index 0).
+function rbSelectTone(toneIdx, filename) {
+    const ed = rbEnsureEditorState();
+    ed.selectedToneIdx = toneIdx;
+    ed.selectedPIdx = 0;
+    rbReRenderSongEditor(filename);
+}
+
+function rbSelectPiece(toneIdx, pIdx) {
+    const ed = rbEnsureEditorState();
+    ed.selectedToneIdx = toneIdx;
+    ed.selectedPIdx = pIdx;
+    rbReRenderSongEditor();
+}
+
+// Full redraw of the song editor without re-fetching from the backend.
+// Used after in-memory mutations (reorder, bypass toggle) — server-side
+// edits use rbRefreshSongAfterEdit which does an extra /song fetch.
+function rbReRenderSongEditor(filename) {
+    if (!rbState.songTones) return;
+    const el = document.getElementById('rb-song-tones');
+    if (!el) return;
+    const f = filename || rbState.currentSongFile;
+    el.innerHTML = rbRenderSongEditor(rbState.songTones, f);
+}
+
+// Backwards-compat shim so the old call sites (rbAutoDownloadSong,
+// rbRefreshSongAfterEdit) still trigger a redraw of the active tone.
+// The arg list stays the same but we re-render the whole editor — the
+// chain strip + detail panel both need to refresh after any chain
+// change (variant override, gear swap, add/remove piece).
+function rbReRenderToneChain(toneIdx, filename) {
+    rbReRenderSongEditor(filename);
+}
+
+// rbRenderPiece kept as a thin shim — the v2 editor renders pieces via
+// rbRenderPieceCard (chain strip) + rbRenderPieceEditor (detail panel)
+// instead. Anyone still calling rbRenderPiece by mistake gets the
+// detail-panel form so they don't render an empty box.
+function rbRenderPiece(p, toneIdx, pIdx) {
+    return rbRenderPieceEditor(p, toneIdx, pIdx, rbState.currentSongFile || '');
 }
 
 // Quick "🎛 Edit VST" shortcut for per-tone pieces that already have a VST
@@ -2025,7 +2503,21 @@ function rbRenderPiece(p, toneIdx, pIdx) {
 function rbFilterVstParams(params) {
     return (params || []).filter(p => {
         const n = String(p.name ?? p.label ?? '').trim();
-        return !/^midi\s*cc\b/i.test(n);
+        // MIDI CC / MIDI Learn assignments — never user-meaningful in our
+        // chain editor.
+        if (/^midi/i.test(n)) return false;
+        // Generic 'Param 1..4' placeholders. Melda exposes 4 of these on
+        // most of its free plugins as preset-mappable hooks; they have no
+        // effect unless wired in the Melda UI to a sound param.
+        if (/^param\s+\d+$/i.test(n)) return false;
+        // Preset cycling triggers ('previous (Preset trigger)' / 'next
+        // (Preset trigger)') — host-automation hooks, not sound params.
+        if (/\(\s*preset\s+trigger\s*\)/i.test(n)) return false;
+        // Bypass + Program — the chain editor has its own dedicated
+        // Bypass UI; Program is an internal patch index irrelevant here.
+        if (/^bypass$/i.test(n)) return false;
+        if (/^program$/i.test(n)) return false;
+        return true;
     });
 }
 
@@ -2171,22 +2663,15 @@ async function rbToneEditVst(toneIdx, pIdx) {
         piece._vst_opaque = piece._vst_opaque
             || rbParseVstStateOpaque(piece._vst_state)
             || rbParseVstStateOpaque(piece.assigned && piece.assigned.vst_state);
-        // Re-apply previously captured params if any.
+        // Re-apply previously captured params if any. Helper resolves NAME
+        // keys (from apply_vst_state.py bulk-populated states) → numeric
+        // ids and clamps values to [0,1]. Without this, name-keyed states
+        // silently no-op (parseInt("Threshold")=NaN) → editor opens at
+        // plugin defaults.
         const saved = piece._vst_params
             || (piece.assigned && piece.assigned.vst_state
                 ? rbParseVstStateParams(piece.assigned.vst_state) : null);
-        if (saved && typeof api.setParameter === 'function') {
-            for (const [pid, v] of Object.entries(saved)) {
-                try { await api.setParameter(slotId, parseInt(pid, 10), parseFloat(v)); } catch (_) {}
-            }
-        }
-        let params = [];
-        if (typeof api.getParameters === 'function') {
-            try {
-                const raw = await api.getParameters(slotId);
-                if (Array.isArray(raw)) params = raw;
-            } catch (_) {}
-        }
+        const params = await rbRestoreSavedParamsToSlot(api, slotId, saved);
         piece._vst_param_meta = params;
         // Seed _vst_params with the FULL current snapshot so subsequent
         // slider drags modify a complete dict (not just the touched ids).
@@ -2361,108 +2846,26 @@ async function rbToneCaptureVstState(toneIdx, pIdx) {
     }
 }
 
-// ── Local library picker (pick from already-downloaded NAMs / IRs) ────
+// ── Library label helpers (still used by piece + catalog renderers) ────
+//
+// The per-song "📚 Library" button was removed once the 🔁 Swap and the
+// Gear-catalog 📚 Library cover the same ground without duplication.
+// These two short helpers stayed because the piece/catalog renderers
+// still call rbLibShortName / rbLibLabel to humanise tone3000 filenames.
 
-// Open/close the per-piece library picker. Loads the file list on first
-// open and caches it; the dropdown then renders client-side filtering.
-async function rbToggleLibraryPicker(toneIdx, pIdx) {
-    const el = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
-    if (!el) return;
-    el.classList.toggle('hidden');
-    if (el.classList.contains('hidden')) return;
-    if (el.dataset.built === '1') return;
-    el.dataset.built = '1';
-    const fileLabel = rbState.songTones.tones[toneIdx].chain[pIdx].rs_category === 'cab' ? 'IRs' : 'NAMs';
-    el.innerHTML = `
-        <div class="flex items-center gap-1 mb-2 border-b border-gray-800">
-            <button id="rb-lib-tab-files-${toneIdx}-${pIdx}" onclick="rbLibTab(${toneIdx}, ${pIdx}, 'files')"
-                    class="px-3 py-1 text-xs border-b-2">📚 ${fileLabel}</button>
-            <button id="rb-lib-tab-plugins-${toneIdx}-${pIdx}" onclick="rbLibTab(${toneIdx}, ${pIdx}, 'plugins')"
-                    class="px-3 py-1 text-xs border-b-2">🎛 Plugins</button>
-        </div>
-        <div id="rb-lib-content-${toneIdx}-${pIdx}"></div>`;
-    rbLibTab(toneIdx, pIdx, 'files');
-}
-
-// Switch the per-piece library picker between local NAM/IR files and the
-// scanned VST/AU plugins. The Plugins tab reuses the full VST panel (search,
-// category groups, hide-instruments, assign, param editor). Files are loaded
-// once and cached on the outer element so the filter can re-render quickly.
-async function rbLibTab(toneIdx, pIdx, tab) {
-    const el = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
-    const content = document.getElementById(`rb-lib-content-${toneIdx}-${pIdx}`);
-    if (!el || !content) return;
-    const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
-    for (const t of ['files', 'plugins']) {
-        const b = document.getElementById(`rb-lib-tab-${t}-${toneIdx}-${pIdx}`);
-        if (b) {
-            const on = t === tab;
-            b.classList.toggle('border-indigo-400', on);
-            b.classList.toggle('text-indigo-300', on);
-            b.classList.toggle('border-transparent', !on);
-            b.classList.toggle('text-gray-400', !on);
-        }
-    }
-    if (tab === 'plugins') {
-        const cur = piece._vst_staged_path || (piece.assigned && piece.assigned.vst_path) || '';
-        const fmt = piece._vst_format || (piece.assigned && piece.assigned.vst_format) || 'VST3';
-        content.innerHTML = rbRenderVstPanelBody(toneIdx, pIdx, cur, fmt);
-        return;
-    }
-    const kind = piece.rs_category === 'cab' ? 'ir' : 'nam';
-    if (el.dataset.filesLoaded !== '1') {
-        content.innerHTML = `<div class="text-xs text-gray-500">loading library…</div>`;
-        try {
-            const r = await fetch(`${RB_API}/local_files?kind=${kind}`);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const data = await r.json();
-            el._rbAllFiles = data.files || [];
-            el.dataset.kind = kind;
-            el.dataset.filesLoaded = '1';
-        } catch (e) {
-            content.innerHTML = `<div class="text-xs text-red-400">Failed to load library: ${rbEsc(e.message || e)}</div>`;
-            return;
-        }
-    }
-    rbRenderLibraryList(content, el._rbAllFiles, toneIdx, pIdx, kind, '');
-}
-
-// Initial render of the library picker: lays out the (stable) header
-// with the search input + count badge + the rows container. The input is
-// never re-created after this, so typing doesn't lose focus.
-function rbRenderLibraryList(container, files, toneIdx, pIdx, kind, filter) {
-    const inputId = `rb-lib-search-${toneIdx}-${pIdx}`;
-    const countId = `rb-lib-count-${toneIdx}-${pIdx}`;
-    const rowsId  = `rb-lib-rows-${toneIdx}-${pIdx}`;
-    container.innerHTML = `
-        <div class="flex items-center gap-2 mb-2">
-            <input id="${inputId}" type="text" placeholder="🔍 Filter ${kind === 'ir' ? 'IRs' : 'NAMs'}…"
-                   oninput="rbFilterLibrary(${toneIdx}, ${pIdx})"
-                   value="${rbEsc(filter || '')}"
-                   class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1">
-            <span id="${countId}" class="text-[10px] text-gray-500">${files.length}/${files.length}</span>
-        </div>
-        <div id="${rowsId}" class="max-h-64 overflow-y-auto"></div>`;
-    rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter);
-}
-
-// Inner-only render: refreshes the rows + count badge based on the current
-// filter, but leaves the search <input> alone so focus + cursor position
-// survive every keystroke. Called both on initial paint and on every
-// oninput event.
-// Disambiguate library rows that share a tone3000 title (several captures
-// can all be called "EQ"): show the title, and append the technical filename
-// in muted text only when the title alone is ambiguous in the shown list.
 // Short, readable form of a downloaded filename: drop the
-// tone3000_<id>_m<model>_ prefix and the extension, leaving the descriptive
-// tail (the Rocksmith gear), e.g. "tone3000_31843_m146073_Rack_StudioEQ.nam"
-// -> "Rack_StudioEQ". Non-tone3000 files just lose their extension.
+// tone3000_<id>_m<model>_ prefix and the extension, leaving the
+// descriptive tail. Non-tone3000 files just lose their extension.
 function rbLibShortName(name) {
     const base = String(name || '').replace(/\.[^./]+$/, '');
     const m = base.match(/^tone3000_\d+_m\d+_(.+)$/);
     return m ? m[1] : base;
 }
 
+// Disambiguate library rows that share a tone3000 title (several
+// captures can all be called "EQ"): show the title, and append the
+// technical filename in muted text only when the title alone is
+// ambiguous within the visible list.
 function rbLibLabel(file, titleCounts) {
     const t = file.title;
     const short = rbLibShortName(file.name);
@@ -2473,63 +2876,223 @@ function rbLibLabel(file, titleCounts) {
     return rbEsc(t);
 }
 
-function rbRenderLibraryRows(container, files, toneIdx, pIdx, kind, filter) {
-    const rowsEl  = document.getElementById(`rb-lib-rows-${toneIdx}-${pIdx}`);
-    const countEl = document.getElementById(`rb-lib-count-${toneIdx}-${pIdx}`);
-    if (!rowsEl) return;
-    const f = (filter || '').toLowerCase().trim();
-    const filtered = f
-        ? files.filter(x => (x.name + ' ' + (x.title || '')).toLowerCase().includes(f))
-        : files;
-    const titleCounts = {};
-    filtered.forEach(x => { if (x.title) titleCounts[x.title] = (titleCounts[x.title] || 0) + 1; });
-    const rows = filtered.slice(0, 50).map(file => {
-        const usedFor = (file.used_for_gears || []).slice(0, 2).join(', ');
-        const usedBadge = file.use_count > 0
-            ? `<span class="text-[10px] text-amber-300/80" title="${rbEsc(usedFor)}">used ${file.use_count}×</span>`
-            : `<span class="text-[10px] text-gray-600">unused</span>`;
-        const safeName = file.name.replace(/'/g, "\\'");
+// ── Per-song variant override + per-song gear swap ──────────────────────
+//
+// Two related editor flows scoped to a single preset (one song's tone):
+//
+//   rbPickVariant    — force a curated gain variant (clean/crunch/dist)
+//                      for an amp with multi-NAM gain_variants. Backed
+//                      by POST /piece_variant_override.
+//
+//   rbToggleGearSwap — open a category-filtered picker showing curated
+//                      gears with photos. Picking one swaps THIS song's
+//                      piece to that gear's NAM (variant auto-picked
+//                      by the row's Gain knob). Backed by POST
+//                      /gear/replace_with with `preset_id`.
+//
+// Both operations mark `assigned_mode='manual'` on the row so a Remap
+// All sweep won't undo the user's choice. Both refresh the song view
+// from the server so all derived state (amp_variant badge, primaries,
+// stage labels) re-renders consistently.
+
+async function rbPickVariant(toneIdx, pIdx, level) {
+    const tone = rbState.songTones && rbState.songTones.tones && rbState.songTones.tones[toneIdx];
+    const piece = tone && tone.chain && tone.chain[pIdx];
+    if (!tone || !piece) return;
+    // Save first if this tone has never been persisted (no preset_id) —
+    // the override endpoint needs an existing row to UPDATE.
+    let presetId = tone.preset_id;
+    if (presetId == null) {
+        presetId = await rbPersistTone(toneIdx);
+        if (presetId == null) {
+            alert('Could not persist the tone before overriding the variant.');
+            return;
+        }
+    }
+    try {
+        const r = await fetch(`${RB_API}/piece_variant_override`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                preset_id: presetId,
+                rs_gear: piece.type,
+                variant: level || 'auto',
+            }),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            alert(`Variant override failed: ${err.error || r.status}`);
+            return;
+        }
+        await rbRefreshSongAfterEdit(toneIdx);
+    } catch (e) {
+        alert(`Variant override failed: ${e.message || e}`);
+    }
+}
+
+async function rbToggleGearSwap(toneIdx, pIdx) {
+    const panel = document.getElementById(`rb-swap-${toneIdx}-${pIdx}`);
+    if (!panel) return;
+    if (!panel.classList.contains('hidden')) {
+        panel.classList.add('hidden');
+        return;
+    }
+    panel.classList.remove('hidden');
+    const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
+    const category = piece.rs_category || 'amp';
+    panel.innerHTML = `<div class="text-xs text-gray-500">Loading ${rbEsc(category)}s…</div>`;
+    try {
+        const gears = await rbLoadGearsInCategory(category);
+        rbRenderGearSwapPanel(panel, gears, piece, toneIdx, pIdx);
+    } catch (e) {
+        panel.innerHTML = `<div class="text-xs text-red-400">Failed to load gears: ${rbEsc(e.message || e)}</div>`;
+    }
+}
+
+// Cached fetch of /gears_in_category so opening the picker on a second
+// piece in the same session is instant. Cached at the module level —
+// invalidated by an explicit window.__rbGearCatCache = null if needed.
+async function rbLoadGearsInCategory(category) {
+    window.__rbGearCatCache = window.__rbGearCatCache || {};
+    if (window.__rbGearCatCache[category]) return window.__rbGearCatCache[category];
+    const r = await fetch(`${RB_API}/gears_in_category/${encodeURIComponent(category)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    window.__rbGearCatCache[category] = data.gears || [];
+    return window.__rbGearCatCache[category];
+}
+
+function rbRenderGearSwapPanel(panel, gears, piece, toneIdx, pIdx) {
+    const fromGear = piece.type;
+    const cards = gears.map(g => {
+        const dim = g.rs_gear === fromGear ? 'opacity-40 cursor-not-allowed' : 'hover:bg-amber-900/30 cursor-pointer';
+        const img = g.image
+            ? `<img src="${rbEsc(g.image)}" alt="" loading="lazy" class="w-9 h-9 rounded object-cover bg-dark-900 flex-shrink-0">`
+            : `<div class="w-9 h-9 rounded bg-dark-900 flex items-center justify-center text-gray-700 text-[9px] flex-shrink-0">no photo</div>`;
+        const variantBadge = g.variant_count > 0
+            ? `<span class="text-[9px] text-emerald-400 bg-emerald-900/30 border border-emerald-800/40 rounded px-1">${g.variant_count}×</span>`
+            : `<span class="text-[9px] text-gray-600">no variants</span>`;
+        const onclick = g.rs_gear === fromGear ? '' :
+            `onclick="rbConfirmGearSwap(${toneIdx}, ${pIdx}, '${rbEsc(g.rs_gear)}')"`;
         return `
-            <div class="flex items-center gap-2 px-2 py-1 hover:bg-indigo-900/20 rounded cursor-pointer"
-                 onclick="rbPickFromLibrary(${toneIdx}, ${pIdx}, '${rbEsc(safeName)}', '${rbEsc(kind)}')">
-                <span class="flex-1 text-[11px] text-gray-200 truncate" title="${rbEsc(file.name)}">${rbLibLabel(file, titleCounts)}</span>
-                ${usedBadge}
-                <button onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(safeName)}', '${rbEsc(kind === 'ir' ? 'ir' : 'nam')}', null)"
-                        title="Audition in isolation"
-                        class="text-[10px] text-gray-400 hover:text-gray-200 px-1">▶</button>
+            <div ${onclick} class="flex items-center gap-2 p-1.5 rounded ${dim}">
+                ${img}
+                <div class="min-w-0 flex-1">
+                    <div class="text-xs text-gray-200 truncate">${rbEsc(g.name)}</div>
+                    <div class="text-[10px] text-gray-500 truncate">${rbEsc(g.rs_gear)}</div>
+                </div>
+                ${variantBadge}
             </div>`;
     }).join('');
-    const moreNote = filtered.length > 50
-        ? `<div class="text-[10px] text-gray-500 italic mt-1">…and ${filtered.length - 50} more (refine search)</div>`
-        : '';
-    rowsEl.innerHTML = (rows || '<div class="text-xs text-gray-500 italic">no matches</div>') + moreNote;
-    if (countEl) countEl.textContent = `${filtered.length}/${files.length}`;
+    const inputId = `rb-swap-search-${toneIdx}-${pIdx}`;
+    panel.innerHTML = `
+        <div class="flex items-center gap-2 mb-2">
+            <span class="text-[11px] text-amber-300">🔁 Swap with…</span>
+            <input id="${inputId}" type="text" placeholder="🔍 Filter gears…"
+                   oninput="rbFilterGearSwap(${toneIdx}, ${pIdx})"
+                   class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-0.5">
+            <span class="text-[10px] text-gray-500">${gears.length} gears</span>
+        </div>
+        <div id="rb-swap-rows-${toneIdx}-${pIdx}" class="max-h-72 overflow-y-auto grid grid-cols-2 gap-1">${cards}</div>
+        <div class="text-[10px] text-gray-500 italic mt-2">Gears with curated multi-NAM variants are recommended. Cabs are skipped — use the IR dropdown instead.</div>`;
+    panel._rbGearList = gears;
+    panel._rbToneIdx = toneIdx;
+    panel._rbPIdx = pIdx;
+    panel._rbFromGear = fromGear;
 }
 
-function rbFilterLibrary(toneIdx, pIdx) {
-    const container = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
-    if (!container || !container._rbAllFiles) return;
-    const input = document.getElementById(`rb-lib-search-${toneIdx}-${pIdx}`);
-    rbRenderLibraryRows(container, container._rbAllFiles, toneIdx, pIdx,
-                        container.dataset.kind || 'nam', input ? input.value : '');
+function rbFilterGearSwap(toneIdx, pIdx) {
+    const panel = document.getElementById(`rb-swap-${toneIdx}-${pIdx}`);
+    if (!panel || !panel._rbGearList) return;
+    const input = document.getElementById(`rb-swap-search-${toneIdx}-${pIdx}`);
+    const rows = document.getElementById(`rb-swap-rows-${toneIdx}-${pIdx}`);
+    if (!input || !rows) return;
+    const q = (input.value || '').toLowerCase().trim();
+    const filtered = q
+        ? panel._rbGearList.filter(g => (g.name + ' ' + g.rs_gear).toLowerCase().includes(q))
+        : panel._rbGearList;
+    const fromGear = panel._rbFromGear;
+    rows.innerHTML = filtered.map(g => {
+        const dim = g.rs_gear === fromGear ? 'opacity-40 cursor-not-allowed' : 'hover:bg-amber-900/30 cursor-pointer';
+        const img = g.image
+            ? `<img src="${rbEsc(g.image)}" alt="" loading="lazy" class="w-9 h-9 rounded object-cover bg-dark-900 flex-shrink-0">`
+            : `<div class="w-9 h-9 rounded bg-dark-900 flex items-center justify-center text-gray-700 text-[9px] flex-shrink-0">no photo</div>`;
+        const variantBadge = g.variant_count > 0
+            ? `<span class="text-[9px] text-emerald-400 bg-emerald-900/30 border border-emerald-800/40 rounded px-1">${g.variant_count}×</span>`
+            : `<span class="text-[9px] text-gray-600">no variants</span>`;
+        const onclick = g.rs_gear === fromGear ? '' :
+            `onclick="rbConfirmGearSwap(${toneIdx}, ${pIdx}, '${rbEsc(g.rs_gear)}')"`;
+        return `
+            <div ${onclick} class="flex items-center gap-2 p-1.5 rounded ${dim}">
+                ${img}
+                <div class="min-w-0 flex-1">
+                    <div class="text-xs text-gray-200 truncate">${rbEsc(g.name)}</div>
+                    <div class="text-[10px] text-gray-500 truncate">${rbEsc(g.rs_gear)}</div>
+                </div>
+                ${variantBadge}
+            </div>`;
+    }).join('') || '<div class="text-xs text-gray-500 italic col-span-2">no matches</div>';
 }
 
-// Apply a chosen file from the library to this piece. Mirrors the upload
-// flow: set _uploaded_file + _uploaded_kind, re-render, re-audition.
-function rbPickFromLibrary(toneIdx, pIdx, fileName, kind) {
-    const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
-    piece._uploaded_file = fileName;
-    piece._uploaded_kind = kind;
-    // Picking from local library = drop any pending VST assignment so
-    // the NAM/IR takes priority (kind precedence is in rbPersistTone).
-    piece._vst_path = null;
-    piece._vst_format = null;
-    piece._vst_kind = null;
-    piece._vst_state = null;
-    // Collapse the picker so the song-list isn't covered after the click.
-    const lib = document.getElementById(`rb-lib-${toneIdx}-${pIdx}`);
-    if (lib) lib.classList.add('hidden');
-    rbAfterGearChange(toneIdx);
+async function rbConfirmGearSwap(toneIdx, pIdx, toRsGear) {
+    const tone = rbState.songTones && rbState.songTones.tones && rbState.songTones.tones[toneIdx];
+    const piece = tone && tone.chain && tone.chain[pIdx];
+    if (!tone || !piece) return;
+    // Save first if no preset_id — replace_with needs an existing row.
+    let presetId = tone.preset_id;
+    if (presetId == null) {
+        presetId = await rbPersistTone(toneIdx);
+        if (presetId == null) {
+            alert('Could not persist the tone before swapping the gear.');
+            return;
+        }
+    }
+    try {
+        const r = await fetch(`${RB_API}/gear/replace_with`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                preset_id: presetId,
+                from_rs_gear: piece.type,
+                to_rs_gear: toRsGear,
+            }),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            alert(`Gear swap failed: ${err.error || r.status}`);
+            return;
+        }
+        const data = await r.json();
+        if (data.pieces_updated === 0) {
+            alert('Swap failed — this gear has no NAM or VST associated yet. Open the All Gear tab and assign one to this gear first, then try the swap again.');
+            return;
+        }
+        // Collapse the swap panel and refresh.
+        const panel = document.getElementById(`rb-swap-${toneIdx}-${pIdx}`);
+        if (panel) panel.classList.add('hidden');
+        await rbRefreshSongAfterEdit(toneIdx);
+    } catch (e) {
+        alert(`Gear swap failed: ${e.message || e}`);
+    }
+}
+
+// Refresh the open song from the server after a server-side edit
+// (variant override / gear swap / etc.) so derived state shown in the
+// piece cards reflects what the next ▶ Listen will load. Falls back to
+// silently no-op if no song is open (shouldn't happen from these flows).
+async function rbRefreshSongAfterEdit(toneIdx) {
+    const filename = rbState.songTones && rbState.songTones.filename;
+    if (!filename) return;
+    try {
+        const r = await fetch(`${RB_API}/song/${encodeURIComponent(filename)}`);
+        if (!r.ok) return;
+        const fresh = await r.json();
+        // Seed bypass on the fresh data BEFORE replacing rbState so the
+        // re-rendered chain shows the right bypass state. rbSeedBypass
+        // walks data.tones[*].chain[*] and copies bypassed → _bypassed.
+        if (typeof rbSeedBypass === 'function') rbSeedBypass(fresh);
+        rbState.songTones = fresh;
+        // Re-render only the affected chain to keep scroll position.
+        rbReRenderToneChain(toneIdx, filename);
+    } catch (_) { /* ignore */ }
 }
 
 // ── Master chain (global pre/post FX) ──────────────────────────────────
@@ -2789,23 +3352,13 @@ async function rbMasterEditVst(role, idx) {
         piece._vst_opaque = piece._vst_opaque
             || rbParseVstStateOpaque(piece._vst_state)
             || rbParseVstStateOpaque(piece.assigned && piece.assigned.vst_state);
-        // Re-apply any previously-captured param state.
+        // Re-apply any previously-captured param state. Helper resolves
+        // NAME keys → numeric ids and clamps to [0,1]; same fix as the
+        // per-tone editor path.
         const saved = piece._vst_params
             || (piece.assigned && piece.assigned.vst_state
                 ? rbParseVstStateParams(piece.assigned.vst_state) : null);
-        if (saved && typeof api.setParameter === 'function') {
-            for (const [pid, v] of Object.entries(saved)) {
-                try { await api.setParameter(slotId, parseInt(pid, 10), parseFloat(v)); } catch (_) {}
-            }
-        }
-        // Grab the live param list (after the restore so values reflect it).
-        let params = [];
-        if (typeof api.getParameters === 'function') {
-            try {
-                const raw = await api.getParameters(slotId);
-                if (Array.isArray(raw)) params = raw;
-            } catch (_) {}
-        }
+        const params = await rbRestoreSavedParamsToSlot(api, slotId, saved);
         piece._vst_param_meta = params;
         // Seed _vst_params with the FULL current snapshot. Without this,
         // subsequent slider drags would write a PARTIAL dict — untouched
@@ -3270,6 +3823,16 @@ function rbMovePiece(toneIdx, pIdx, direction) {
     const tmp = tone.chain[pIdx];
     tone.chain[pIdx] = tone.chain[newIdx];
     tone.chain[newIdx] = tmp;
+    // If the user moved the SELECTED piece (the common case now that
+    // ◀ / ▶ live in the chain strip next to it), keep the selection
+    // glued to that piece — otherwise the detail panel would suddenly
+    // be editing whatever piece ended up at the old index.
+    const ed = rbEnsureEditorState();
+    if (ed.selectedToneIdx === toneIdx && ed.selectedPIdx === pIdx) {
+        ed.selectedPIdx = newIdx;
+    } else if (ed.selectedToneIdx === toneIdx && ed.selectedPIdx === newIdx) {
+        ed.selectedPIdx = pIdx;
+    }
     // Persist + re-render.
     tone.chain_source = 'edited';
     rbAfterChainEdit(toneIdx);
@@ -3848,7 +4411,27 @@ async function rbApplyRsSettingsToVst(toneIdx, pIdx) {
     });
 
     let applied = 0, skipped = [];
+    // Static defaults first — curator-pinned params applied regardless of
+    // RS knobs (e.g. kHs Distortion Mode + Dynamics so fuzz pedals sound
+    // like fuzz, etc.). Values already normalized [0,1].
+    const staticBlock = mapping._static;
+    if (staticBlock && typeof staticBlock === 'object') {
+        for (const [pname, pval] of Object.entries(staticBlock)) {
+            const tid = nameToId[String(pname).toLowerCase()];
+            if (tid == null) { skipped.push(`_static.${pname} (param not on VST)`); continue; }
+            const v = Math.max(0, Math.min(1, parseFloat(pval)));
+            try {
+                await api.setParameter(piece._vst_slot_id, tid, v);
+                piece._vst_params = piece._vst_params || {};
+                piece._vst_params[tid] = v;
+                applied++;
+            } catch (e) {
+                skipped.push(`_static.${pname} (setParameter threw: ${e.message || e})`);
+            }
+        }
+    }
     for (const [rsKnobName, rule] of Object.entries(mapping)) {
+        if (rsKnobName === '_static') continue;   // handled above
         if (!(rsKnobName in rsKnobs)) { skipped.push(`${rsKnobName} (not on this gear)`); continue; }
         const rsValue = parseFloat(rsKnobs[rsKnobName]);
         if (isNaN(rsValue)) { skipped.push(`${rsKnobName} (NaN)`); continue; }
@@ -4062,6 +4645,18 @@ async function rbDoVstScan(statusSetter) {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({plugins: rbState.knownVsts}),
         }).catch(() => {});
+        // The backend merges scan results with previously-seeded entries
+        // (seed_known_vsts.py + any prior successful scans), so the merged
+        // total can be > what scan returned this run. Re-fetch /vst/known
+        // to pick up the merged list instead of showing only what scan
+        // got before crashing.
+        try {
+            const merged = await (await fetch(`${RB_API}/vst/known`)).json();
+            if (Array.isArray(merged.plugins) &&
+                merged.plugins.length >= rbState.knownVsts.length) {
+                rbState.knownVsts = merged.plugins;
+            }
+        } catch (_) { /* fall back to local scan result */ }
         statusSetter && statusSetter(`found ${rbState.knownVsts.length} plugins`);
         return rbState.knownVsts;
     } finally {
@@ -4126,6 +4721,106 @@ function rbResolveStagedPath(toneIdx, pIdx) {
     return (piece.assigned && piece.assigned.vst_path) || '';
 }
 
+// Restore a saved {paramId|paramName → value} dict into a freshly-loaded
+// VST slot. Returns the live `getParameters()` snapshot AFTER restoration
+// (or `[]` if the engine lacks `getParameters`). Used by all 3 editor-open
+// paths (per-tone Load & Edit, per-tone 🎛 Edit VST, master 🎛 Edit VST)
+// to avoid duplicating name→id resolution + value clamping logic.
+//
+// Why we need both name→id and clamp: `apply_vst_state.py` writes param
+// NAMES (durable across plugin versions, e.g. {"Threshold": 0.2}), while
+// a 📸 Capture writes numeric IDs ({"5": 0.2}). The engine's setParameter
+// takes ID + normalized [0,1]. Without name resolution, the bulk-populated
+// states silently no-op (parseInt("Threshold") = NaN → editor opens at
+// plugin defaults). Without clamping, an out-of-range value gets pinned
+// to the param's min or behaves erratically (see `Gain -2328 dB` bug).
+async function rbRestoreSavedParamsToSlot(api, slotId, savedParams) {
+    // Small grace period after loadVST. Some JUCE-hosted VST3 plugins (esp.
+    // larger ones like MCompressor with 150 params) finish parameter setup
+    // a tick or two after loadVST resolves; calling setParameter inside that
+    // window can silently no-op even though it returns without throwing.
+    // Empirically 50 ms is enough on M1 with kHs / Melda free.
+    await new Promise(r => setTimeout(r, 50));
+    let params = [];
+    if (typeof api.getParameters === 'function') {
+        try {
+            const raw = await api.getParameters(slotId);
+            if (Array.isArray(raw)) params = raw;
+        } catch (e) {
+            console.warn('[rig_builder restore] getParameters threw:', e);
+        }
+    }
+    const savedKeys = savedParams ? Object.keys(savedParams) : [];
+    console.log(`[rig_builder restore] slot=${slotId} · ${params.length} live params · ${savedKeys.length} saved keys: ${savedKeys.slice(0, 6).join(', ')}${savedKeys.length > 6 ? '…' : ''}`);
+    if (!savedParams || typeof api.setParameter !== 'function') {
+        console.warn(`[rig_builder restore] slot=${slotId} — no saved params or no setParameter API, skipping`);
+        return params;
+    }
+    const nameToId = {};
+    const idToName = {};
+    params.forEach((p, idx) => {
+        const pid = p.id ?? p.paramId ?? p.index ?? idx;
+        const pname = (p.name ?? p.label ?? '').toLowerCase();
+        if (pname) {
+            nameToId[pname] = pid;
+            idToName[pid] = p.name || p.label;
+        }
+    });
+    const sampleParam = params[0] || {};
+    console.log(`[rig_builder restore] slot=${slotId} · live param shape keys: ${Object.keys(sampleParam).join(', ')} · first 5 names: ${params.slice(0, 5).map(p => p.name || p.label || '<no-name>').join(' | ')}`);
+    let applied = 0;
+    const failed = [];
+    const appliedDetail = [];
+    for (const [pid, v] of Object.entries(savedParams)) {
+        let targetId = parseInt(pid, 10);
+        let resolvedBy = 'numeric';
+        if (isNaN(targetId) || String(targetId) !== String(pid).trim()) {
+            targetId = nameToId[String(pid).toLowerCase()];
+            resolvedBy = (targetId != null) ? 'name' : 'unresolved';
+        }
+        if (targetId == null || isNaN(targetId)) {
+            failed.push(`${pid}(${resolvedBy})`);
+            continue;
+        }
+        const clamped = Math.max(0, Math.min(1, parseFloat(v)));
+        try {
+            await api.setParameter(slotId, targetId, clamped);
+            applied++;
+            appliedDetail.push(`${pid}→[${targetId}]${idToName[targetId] ? '=' + idToName[targetId] : ''}=${clamped.toFixed(3)}`);
+        } catch (e) {
+            failed.push(`${pid}→${targetId}(setParam threw: ${e.message || e})`);
+        }
+    }
+    if (failed.length) {
+        console.warn(`[rig_builder restore] slot=${slotId}: applied ${applied}, FAILED: ${failed.join(', ')}`);
+    } else {
+        console.log(`[rig_builder restore] slot=${slotId}: applied ${applied}/${savedKeys.length} ✓ ${appliedDetail.slice(0, 4).join(' | ')}${appliedDetail.length > 4 ? '…' : ''}`);
+    }
+    // Refresh so the caller sees the actual post-restore values, and log a
+    // verification line confirming the engine accepted the writes (compares
+    // requested vs actual for up to 4 touched params).
+    if (typeof api.getParameters === 'function') {
+        try {
+            const refreshed = await api.getParameters(slotId);
+            if (Array.isArray(refreshed)) {
+                params = refreshed;
+                const verify = [];
+                for (const detail of appliedDetail.slice(0, 4)) {
+                    const m = detail.match(/^.+→\[(\d+)\].*=([\d.]+)$/);
+                    if (!m) continue;
+                    const tid = parseInt(m[1], 10);
+                    const want = parseFloat(m[2]);
+                    const actual = refreshed.find(p => (p.id ?? p.paramId ?? p.index) === tid);
+                    const actualVal = actual ? (actual.value ?? actual.current) : null;
+                    verify.push(`[${tid}] want=${want.toFixed(3)} got=${typeof actualVal === 'number' ? actualVal.toFixed(3) : 'n/a'}`);
+                }
+                if (verify.length) console.log(`[rig_builder restore] slot=${slotId} verify: ${verify.join(' | ')}`);
+            }
+        } catch (_) {}
+    }
+    return params;
+}
+
 async function rbLoadAndEditVst(toneIdx, pIdx) {
     const api = window.slopsmithDesktop && window.slopsmithDesktop.audio;
     if (!api) return alert('Native VST hosting not available');
@@ -4145,32 +4840,14 @@ async function rbLoadAndEditVst(toneIdx, pIdx) {
         // bug — our UI renders crisp at any Retina scale because it's HTML.
         const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
         piece._vst_slot_id = slotId;
-        let params = [];
-        if (typeof api.getParameters === 'function') {
-            try {
-                const raw = await api.getParameters(slotId);
-                if (Array.isArray(raw)) params = raw;
-            } catch (e) {
-                console.warn('[rig_builder] getParameters failed:', e);
-            }
-        }
-        piece._vst_param_meta = params;
         // If we have previously-captured param values, re-apply them so the
         // editor opens with the user's saved tweaks instead of plugin defaults.
+        // Helper resolves NAME keys (from apply_vst_state.py) → numeric ids
+        // and clamps values to [0,1] (engine's normalized range).
         const savedParams = piece._vst_params || (piece.assigned && piece.assigned.vst_state
             ? rbParseVstStateParams(piece.assigned.vst_state) : null);
-        if (savedParams && typeof api.setParameter === 'function') {
-            for (const [pid, v] of Object.entries(savedParams)) {
-                try { await api.setParameter(slotId, parseInt(pid, 10), parseFloat(v)); } catch (_) {}
-            }
-            // Re-query to reflect the restored values.
-            if (typeof api.getParameters === 'function') {
-                try {
-                    const refreshed = await api.getParameters(slotId);
-                    if (Array.isArray(refreshed)) piece._vst_param_meta = refreshed;
-                } catch (_) {}
-            }
-        }
+        const params = await rbRestoreSavedParamsToSlot(api, slotId, savedParams);
+        piece._vst_param_meta = params;
         rbRenderInlineVstParams(toneIdx, pIdx);
         if (statusEl) {
             statusEl.textContent = `loaded slot ${slotId} · ${params.length} params · tweak below, then "Capture state"`;
@@ -4186,10 +4863,20 @@ async function rbLoadAndEditVst(toneIdx, pIdx) {
 // JSON by index — assumes loadPreset preserves order, which is what the
 // audio_engine plugin code path also relies on (see bundle screen.js).
 async function rbReapplyVstParamsToChain(api, chainSpec) {
-    if (typeof api.getChainState !== 'function' || typeof api.setParameter !== 'function') return;
+    if (typeof api.getChainState !== 'function' || typeof api.setParameter !== 'function') {
+        console.warn('[rig_builder reapply] api.getChainState or setParameter missing — walker skipped');
+        return;
+    }
     let loaded;
-    try { loaded = await api.getChainState(); } catch (_) { return; }
-    if (!Array.isArray(loaded)) return;
+    try { loaded = await api.getChainState(); } catch (e) {
+        console.warn('[rig_builder reapply] getChainState failed:', e);
+        return;
+    }
+    if (!Array.isArray(loaded)) {
+        console.warn('[rig_builder reapply] getChainState returned non-array:', loaded);
+        return;
+    }
+    console.log(`[rig_builder reapply] chain has ${loaded.length} loaded stage(s); spec has ${chainSpec.length}`);
     // Walk the SPEC and the LOADED state together. We rely on
     // index alignment — both lists are in signal-flow order.
     for (let i = 0; i < chainSpec.length && i < loaded.length; i++) {
@@ -4214,12 +4901,66 @@ async function rbReapplyVstParamsToChain(api, chainSpec) {
         }
         if (!params || Object.keys(params).length === 0) continue;
         const slotId = slot.id ?? slot.slotId ?? i;
-        for (const [pid, v] of Object.entries(params)) {
+        console.log(`[rig_builder reapply] stage ${i} (slot ${slotId}): ${Object.keys(params).length} params to apply — keys: ${Object.keys(params).slice(0, 5).join(', ')}${Object.keys(params).length > 5 ? '…' : ''}`);
+
+        // Resolve param NAMES (string keys) to IDs via getParameters(),
+        // same pattern as the manual ⇶ Apply RS settings flow. Keys that
+        // are already numeric strings (or numbers) skip the lookup.
+        // This makes bulk-populated vst_states (apply_vst_state.py writes
+        // {paramName: value}) restore correctly on real song playback.
+        let nameToId = null;
+        const needsResolve = Object.keys(params).some(
+            k => isNaN(parseInt(k, 10)) || String(parseInt(k, 10)) !== String(k).trim()
+        );
+        if (needsResolve && typeof api.getParameters === 'function') {
             try {
-                await api.setParameter(slotId, parseInt(pid, 10), parseFloat(v));
+                const paramList = await api.getParameters(slotId);
+                if (Array.isArray(paramList)) {
+                    nameToId = {};
+                    paramList.forEach((p, idx) => {
+                        const pid = p.id ?? p.paramId ?? p.index ?? idx;
+                        const pname = (p.name ?? p.label ?? '').toLowerCase();
+                        if (pname) nameToId[pname] = pid;
+                    });
+                    console.log(`[rig_builder reapply] slot ${slotId}: getParameters returned ${paramList.length} params; first 5 names: ${paramList.slice(0, 5).map(p => p.name || p.label).join(' | ')}`);
+                } else {
+                    console.warn(`[rig_builder reapply] slot ${slotId}: getParameters returned non-array:`, paramList);
+                }
             } catch (e) {
-                console.warn(`[rig_builder] setParameter slot=${slotId} param=${pid}:`, e);
+                console.warn(`[rig_builder reapply] slot ${slotId}: getParameters threw:`, e);
             }
+        }
+
+        let appliedCount = 0;
+        const failed = [];
+        for (const [pid, v] of Object.entries(params)) {
+            let targetId = parseInt(pid, 10);
+            if ((isNaN(targetId) || String(targetId) !== String(pid).trim()) && nameToId) {
+                targetId = nameToId[String(pid).toLowerCase()];
+            }
+            if (targetId == null || isNaN(targetId)) {
+                failed.push(pid);
+                continue;
+            }
+            // Engine takes normalized [0,1]. Old states may still carry raw
+            // dB/Hz values from before the apply_vst_state.py normalization
+            // fix — clamp defensively so they don't pin params to the wrong
+            // extreme (the symptom that produced "Gain -2328 dB" in the
+            // editor). New states are already normalized so clamp is a no-op
+            // for them.
+            const clamped = Math.max(0, Math.min(1, parseFloat(v)));
+            try {
+                await api.setParameter(slotId, targetId, clamped);
+                appliedCount++;
+            } catch (e) {
+                console.warn(`[rig_builder reapply] setParameter slot=${slotId} param=${pid}(${targetId}):`, e);
+                failed.push(`${pid}(setParam threw)`);
+            }
+        }
+        if (failed.length) {
+            console.warn(`[rig_builder reapply] slot ${slotId}: applied ${appliedCount} params, failed: ${failed.join(', ')}`);
+        } else {
+            console.log(`[rig_builder reapply] slot ${slotId}: applied ${appliedCount} params ✓`);
         }
     }
 }
@@ -4433,6 +5174,20 @@ function rbAssignRsIr(btn, toneIdx, pIdx) {
     rbAfterGearChange(toneIdx);   // reflect + re-audition immediately
 }
 
+// Click handler for the cab mic-position buttons. The mic_variants
+// payload (per piece) already came with the resolved ir_file for each
+// suffix — we just pin that file as the assigned IR, mark the piece
+// kind as rs_ir, and let the chain-edit flow persist + reload.
+function rbPickCabMic(toneIdx, pIdx, irFile) {
+    const piece = rbState.songTones && rbState.songTones.tones
+        && rbState.songTones.tones[toneIdx]
+        && rbState.songTones.tones[toneIdx].chain[pIdx];
+    if (!piece || !irFile) return;
+    piece._uploaded_file = irFile;
+    piece._uploaded_kind = 'rs_ir';
+    rbAfterGearChange(toneIdx);
+}
+
 async function rbUploadFile(input, toneIdx, pIdx) {
     const file = input.files[0];
     if (!file) return;
@@ -4570,23 +5325,41 @@ async function rbStopPreview() {
     }
     if (wasAudition) {
         const b = document.getElementById(wasAudition);
-        if (b) { b.disabled = false; b.textContent = '▶'; }
+        if (b) {
+            b.disabled = false;
+            // Restore the button's original label ("▶ clean", "▶ crunch",
+            // "▶ Listen", "▶ Dynamic Cone", …) instead of a bare "▶" —
+            // variant audition buttons were losing their level label
+            // every time the user stopped/switched.
+            b.textContent = b.dataset.origLabel || '▶';
+        }
     }
 }
 
 // ── Per-stage bypass (audition each piece in/out of the chain) ─────────
 function rbUpdateBypassBtn(btn, on) {
     if (!btn) return;
-    btn.textContent = on ? '⤳ Bypassed' : 'Bypass';
-    btn.className = 'px-2 py-1 rounded text-xs transition ' + (on
-        ? 'bg-amber-700/40 text-amber-300 border border-amber-600/40'
-        : 'bg-dark-600 hover:bg-dark-500 text-gray-300');
+    // The new song editor uses long descriptive labels on the bypass
+    // button; the legacy compact label is kept as a fallback for any
+    // surviving short-form usage (e.g. master chain).
+    const wantsLong = (btn.textContent || '').includes('signal');
+    btn.textContent = on
+        ? (wantsLong ? '⤳ Bypassed (signal passes through)' : '⤳ Bypassed')
+        : (wantsLong ? 'Bypass this stage' : 'Bypass');
+    btn.className = 'px-3 py-1.5 rounded border text-xs transition ' + (on
+        ? 'bg-amber-700/40 text-amber-300 border-amber-600/40'
+        : 'bg-dark-700 hover:bg-dark-600 text-gray-300 border-gray-700');
 }
 
 function rbToggleBypass(toneIdx, pIdx, btn) {
     const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
     piece._bypassed = !piece._bypassed;
     rbUpdateBypassBtn(btn, piece._bypassed);
+    // Re-render the editor so the chain-strip card's photo (grayscale
+    // when bypassed) and its status dot update immediately — without
+    // this, the visual state only refreshed when the user clicked a
+    // different piece. Cheap enough to do on every toggle.
+    rbReRenderSongEditor();
     // Persist the bypass for this song right away so it survives reload /
     // restart (it used to live only in memory until "Save preset").
     if (rbState.currentSongFile) rbPersistTone(toneIdx, rbState.currentSongFile);
@@ -4679,13 +5452,13 @@ async function rbReloadPreview(refetchPresetId) {
     } catch (e) { console.warn('[rig_builder] reload preview failed', e); }
 }
 
-// Re-render the open song's tone cards from current in-memory state (keeps
-// _uploaded_file + _bypassed), restoring the active preview button label.
+// Re-render the open song's editor from current in-memory state (keeps
+// _uploaded_file + _bypassed + the selected tone/piece in rbState.editor),
+// restoring the active preview button label.
 function rbRerenderSong() {
     const el = document.getElementById('rb-song-tones');
     if (!el || !rbState.songTones || !rbState.currentSongFile) return;
-    el.innerHTML = rbState.songTones.tones
-        .map((t, idx) => rbRenderTone(t, idx, rbState.currentSongFile)).join('');
+    el.innerHTML = rbRenderSongEditor(rbState.songTones, rbState.currentSongFile);
     if (rbState.listeningTone !== null) {
         const b = document.getElementById(`rb-listen-${rbState.listeningTone}`);
         if (b) b.textContent = '⏸ Stop';
@@ -4712,31 +5485,83 @@ async function rbAfterGearChange(toneIdx) {
 // ── Single-stage audition (catalog ▶ and search-candidate ▶) ──────────
 // Loads ONE NAM/IR stage into the engine so you hear that gear in
 // isolation. `btnId` is the toggling button; calling again stops it.
-async function rbAuditionFile(file, kind, btnId) {
+// Perceptual-loudness trim for amp gain-variant auditioning. LUFS
+// normalization in the backend matches integrated loudness across NAMs,
+// but distortion captures still SOUND louder than equally-LUFS-matched
+// clean captures because of sustained harmonic density. Compensate by
+// attenuating progressively for higher-gain variants. Tuned by ear
+// against typical curated 3-tier amps (Marshall JCM800, Twin, etc.).
+// Returns 1.0 (no extra trim) for unknown levels so non-variant amps
+// audition exactly as before.
+function rbAuditionGainForVariantLevel(level) {
+    const TRIM_DB = {
+        clean:    0,
+        crunch:  -3,
+        dist:    -6,
+        // Common alternate level names — keep parity if curators use them.
+        lead:    -6,
+        od:      -3,
+        ultra:   -6,
+        ultraod1:-6,
+    };
+    const dB = TRIM_DB[(level || '').toLowerCase()];
+    if (dB == null) return 1.0;
+    return Math.pow(10, dB / 20);
+}
+
+async function rbAuditionFile(file, kind, btnId, gain, rsGear) {
     const btn = btnId ? document.getElementById(btnId) : null;
     if (rbState._auditionId === btnId) { await rbStopPreview(); return; }
     await rbStopPreview();   // stop any other preview/audition first
     const api = rbNativeAudio();
     if (!api) { alert('Audio engine unavailable. Open the “NAM” plugin once to initialize it.'); return; }
+    // Stash the button's original label (e.g. "▶ clean", "▶ Listen")
+    // so we can restore it after the user stops or switches buttons.
+    // The previous implementation hard-coded "▶" on restore, which
+    // wiped the level/mic label off variant audition buttons.
+    if (btn && !btn.dataset.origLabel) btn.dataset.origLabel = btn.textContent;
     if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
     try {
-        const url = `${RB_API}/native_preset_one?file=${encodeURIComponent(file)}&kind=${encodeURIComponent(kind || 'nam')}`;
+        const gainQs = (typeof gain === 'number' && isFinite(gain))
+            ? `&gain=${encodeURIComponent(gain.toFixed(4))}` : '';
+        const gearQs = (typeof rsGear === 'string' && rsGear)
+            ? `&rs_gear=${encodeURIComponent(rsGear)}` : '';
+        const url = `${RB_API}/native_preset_one?file=${encodeURIComponent(file)}&kind=${encodeURIComponent(kind || 'nam')}${gainQs}${gearQs}`;
         const payload = await (await fetch(url)).json();
         const chain = payload.native_preset && payload.native_preset.chain;
         if (!Array.isArray(chain) || !chain.length) throw new Error('file not found');
         if (api.clearChain) await api.clearChain().catch(() => {});
         const res = await api.loadPreset(JSON.stringify(payload.native_preset));
         if (!res || res.success === false) throw new Error((res && res.error) || 'loadPreset failed');
-        if (api.setGain) { await rbApplyChainInputDrive(); await api.setGain('chain', 1.0).catch(() => {}); }
+        if (api.setGain) {
+            // Chain-level drive matched to the audition target. Bass
+            // amps (rs_gear starts with 'Bass_') use unity to avoid
+            // over-saturating the tone3000 clean-gain capture; the
+            // catalog always knows g.rs_gear so this is reliable.
+            const isBass = typeof rsGear === 'string' && rsGear.startsWith('Bass_');
+            await rbApplyChainInputDrive({ isBass });
+            await api.setGain('chain', 1.0).catch(() => {});
+        }
         if (api.setMonitorMute) await api.setMonitorMute(false).catch(() => {});
         const wasRunning = api.isAudioRunning ? await api.isAudioRunning().catch(() => true) : true;
         await api.startAudio();
         rbState._previewStartedAudio = !wasRunning;
         rbState._previewMode = 'native';
         rbState._auditionId = btnId;
-        if (btn) { btn.disabled = false; btn.textContent = '⏸'; }
+        // "⏸ <label>" lets the user see what they're listening to AND
+        // know how to pause. Falls back to a bare ⏸ when no original
+        // label was captured (legacy button, no dataset.origLabel).
+        if (btn) {
+            btn.disabled = false;
+            const orig = btn.dataset.origLabel || '';
+            const labelTail = orig.replace(/^\s*▶\s*/, '');
+            btn.textContent = labelTail ? `⏸ ${labelTail}` : '⏸';
+        }
     } catch (e) {
-        if (btn) { btn.disabled = false; btn.textContent = '▶'; }
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = btn.dataset.origLabel || '▶';
+        }
         alert(`Could not play: ${e && e.message ? e.message : e}`);
     }
 }
@@ -4748,6 +5573,10 @@ async function rbAuditionCandidate(btn, rsGear, toneId) {
     if (rbState._auditionId === btnId) { await rbStopPreview(); return; }
     await rbStopPreview();
     const old = btn.textContent;
+    // Stash the original label so rbStopPreview can restore it later.
+    // Set BEFORE changing textContent so rbAuditionFile (which only
+    // assigns origLabel if missing) doesn't pick up the ⏳ marker.
+    if (!btn.dataset.origLabel) btn.dataset.origLabel = old;
     btn.disabled = true; btn.textContent = '⏳';
     try {
         const r = await fetch(`${RB_API}/audition_candidate`, {
@@ -4768,8 +5597,9 @@ async function rbAuditionCandidate(btn, rsGear, toneId) {
 let _rbCatalogSeq = 0;
 // Gear-tab nav state. Lives on rbState so toggling filters mid-session
 // doesn't lose the user's setup, and so tab switches re-apply the same
-// filters when they come back. The Set is rebuilt fresh per session.
+// filters when they come back. The Sets are rebuilt fresh per session.
 if (!rbState.gearCollapsedCats) rbState.gearCollapsedCats = new Set();
+if (!rbState.gearExpanded) rbState.gearExpanded = new Set();
 
 const RB_GEAR_LABEL = {
     amp:   'Amplifiers',
@@ -4954,60 +5784,125 @@ function rbRenderCatalogCardCompact(g) {
             </div>
             ${file}
         </div>
-        ${g.file ? `<button id="${btnId}" onclick="rbAuditionFile(${JSON.stringify(g.file)},${JSON.stringify(g.kind || 'nam')},'${btnId}')"
+        ${g.file ? `<button id="${btnId}" onclick="rbAuditionFile(${JSON.stringify(g.file)},${JSON.stringify(g.kind || 'nam')},'${btnId}',undefined,${JSON.stringify(g.rs_gear || '')})"
                             class="text-gray-400 hover:text-emerald-300 px-1.5 py-0.5 text-xs">▶</button>` : ''}
     </div>`;
 }
 
 function rbRenderCatalogCard(g) {
-    const btnId = `rb-aud-${_rbCatalogSeq++}`;
-    const img = g.image
-        ? `<img src="${rbEsc(g.image)}" alt="" loading="lazy" class="w-14 h-14 rounded object-cover bg-dark-900 flex-shrink-0" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'w-14 h-14 rounded bg-dark-900 flex-shrink-0'}))">`
-        : `<div class="w-14 h-14 rounded bg-dark-900 flex items-center justify-center text-gray-700 text-[10px] flex-shrink-0">no photo</div>`;
-    // VST takes priority over NAM/IR in the label/audition button: kind='vst'
-    // with vst_path set means the user has explicitly chosen a plugin for
-    // every preset using this gear.
+    // v2 catalog card — minimal collapsed state, click row to expand
+    // ─────────────────────────────────────────────────────────────
+    // Header (always visible): photo · full name · rs_gear · status pill
+    //   ▸ The full name no longer truncates — it wraps over 2 lines so
+    //     "Marshall JCM800 2203" et al. stay readable.
+    //   ▸ Rocksmith gear photo (/gear_photo/{rs_gear}) first; if the
+    //     RS extraction hasn't been run, fall back to the tone3000
+    //     capture image when the curator has assigned one.
+    //
+    // Action panel (revealed on click): ▶ Listen · 🎚 Variants ·
+    //   📚 Library · 🔍 Search · ↗ tone3000 · the variant audition row
+    //   and the existing Library / Variants panels.
+
+    const safeId = g.rs_gear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const expanded = rbState.gearExpanded && rbState.gearExpanded.has(g.rs_gear);
     const isVst = g.kind === 'vst' && g.vst_path;
-    let parent;
+    // Status is communicated entirely through the photo now: when
+    // nothing is assigned (no NAM, no IR, no VST) the photo goes
+    // grayscale + dimmed, matching the "off" feel of a bypassed piece
+    // in the song editor. No colored dot needed — the visual state is
+    // the indicator.
+    const isAssigned = isVst || g.assigned;
+    const photoOff = isAssigned ? '' : 'grayscale opacity-40';
+
+    // Assignment label — only rendered inside the expanded action panel
+    // now (the collapsed row used to show it under the rs_gear codename,
+    // but that line repeated 100+ times made the catalog feel noisy).
+    let assignedLine;
     if (isVst) {
         const vstName = g.vst_path.split('/').pop();
-        parent = `<span class="text-purple-300" title="${rbEsc(g.vst_path)}">✓ VST: ${rbEsc(vstName)}</span>`;
+        assignedLine = `<div class="text-xs text-purple-300/90 break-all" title="${rbEsc(g.vst_path)}">✓ VST: ${rbEsc(vstName)}</div>`;
     } else if (g.assigned) {
-        parent = `<span class="text-green-400" title="${rbEsc(g.file || '')}">✓ ${rbEsc(g.tone3000_title || rbLibShortName(g.file) || 'assigned')}</span>`;
+        const label = g.tone3000_title || rbLibShortName(g.file) || 'assigned';
+        assignedLine = `<div class="text-xs text-green-400/90 break-all" title="${rbEsc(g.file || '')}">✓ ${rbEsc(label)}</div>`;
     } else {
-        parent = `<span class="text-gray-500">(unassigned)</span>`;
+        assignedLine = `<div class="text-xs text-gray-500">(unassigned)</div>`;
     }
+
+    // Rocksmith art with tone3000 image as a fallback. The sibling-swap
+    // trick avoids the HTML-in-attribute escaping issue we hit in the
+    // song editor — onerror just hides this img and reveals the next
+    // sibling, which is the next photo source down the chain.
+    const rsArt = `${RB_API}/gear_photo/${encodeURIComponent(g.rs_gear)}${_RB_GEAR_PHOTO_CB}`;
+    const onerrChain = "this.style.display='none'; var n=this.nextElementSibling; if(n){ if(n.tagName==='IMG'){n.style.display=''} else {n.classList.remove('hidden')} }";
+    const t3kImgTag = g.image
+        ? `<img src="${rbEsc(g.image)}" alt="" loading="lazy" style="display:none"
+               class="max-w-full max-h-full rounded object-cover bg-dark-900"
+               onerror="${onerrChain}">`
+        : '';
+    const photoBlock = `
+        <div class="flex-shrink-0 w-16 h-16 flex items-center justify-center rounded bg-dark-900 overflow-hidden transition ${photoOff}"
+             title="${isAssigned ? '' : 'Unassigned — no NAM/IR/VST mapped yet'}">
+            <img src="${rsArt}" alt="" loading="lazy"
+                 class="max-w-full max-h-full rounded object-contain"
+                 onerror="${onerrChain}">
+            ${t3kImgTag}
+            <div class="hidden w-full h-full flex items-center justify-center text-gray-700 text-[10px] uppercase tracking-wide">${rbEsc(g.category || 'gear')}</div>
+        </div>`;
+
+    // Action buttons (only rendered when expanded).
+    const btnId = `rb-aud-${_rbCatalogSeq++}`;
+    // ▶ Listen visibility:
+    //   - VST → always (audition has no inline equivalent)
+    //   - Amp with curated gain_variants → no (the ▶ clean/crunch/dist
+    //     row covers it with better labels)
+    //   - Cab with mic_variants → no (the ▶ Dynamic Cone / Condenser
+    //     Edge / … row covers it)
+    //   - Pedal / rack / "other" / amp w/o variants → YES (those have
+    //     no inline audition row, so Listen is the only way to hear
+    //     the assigned gear in isolation from the catalog).
+    const hasInlineAudition = (
+        (Array.isArray(g.variants) && g.variants.length > 0)
+        || (Array.isArray(g.mic_variants) && g.mic_variants.length > 0)
+    );
     let listenBtn = '';
+    let editBtn = '';
     if (isVst) {
-        listenBtn = `<button id="${btnId}" onclick="rbAuditionVst('${rbEsc(g.vst_path).replace(/'/g,"\\'")}','${rbEsc(g.vst_format || 'VST3')}','${btnId}')"
-                            title="Listen to this VST in isolation" class="bg-purple-700/50 hover:bg-purple-600/60 text-purple-100 px-2.5 py-1 rounded text-xs flex-shrink-0">▶</button>`;
-    } else if (g.assigned) {
-        listenBtn = `<button id="${btnId}" onclick="rbAuditionFile('${rbEsc(g.file).replace(/'/g,"\\'")}', '${rbEsc(g.kind || 'nam')}', '${btnId}')"
-                            title="Listen to this gear in isolation" class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-2.5 py-1 rounded text-xs flex-shrink-0">▶</button>`;
+        listenBtn = `<button id="${btnId}" onclick="event.stopPropagation(); rbAuditionVst('${rbEsc(g.vst_path).replace(/'/g,"\\'")}','${rbEsc(g.vst_format || 'VST3')}','${btnId}')"
+                            title="Listen to this VST in isolation"
+                            class="bg-purple-700/50 hover:bg-purple-600/60 text-purple-100 px-3 py-1.5 rounded text-xs">▶ Listen</button>`;
+        // Direct "edit this VST" — loads the plugin and opens the native
+        // editor window. Saves a click vs the 📚 Library re-pick flow when
+        // the gear already has a VST assigned (the common case after the
+        // bulk-assign step). Passes rs_gear so rbCatalogEditVst can apply
+        // the (gear, vst) `_static` defaults (e.g. kHs Distortion Type for
+        // fuzz/od/dist pedals, MEqualizer band-enable flags).
+        editBtn = `<button onclick="event.stopPropagation(); rbCatalogEditVst('${rbEsc(g.vst_path).replace(/'/g,"\\'")}','${rbEsc(g.vst_format || 'VST3')}','${rbEsc(g.rs_gear)}')"
+                           title="Edit this VST's settings (loads + opens native editor, applies _static defaults)"
+                           class="bg-purple-900/40 hover:bg-purple-900/60 text-purple-200 border border-purple-800/50 px-3 py-1.5 rounded text-xs">🎛 Edit</button>`;
+    } else if (g.assigned && !hasInlineAudition) {
+        listenBtn = `<button id="${btnId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(g.file).replace(/'/g,"\\'")}', '${rbEsc(g.kind || 'nam')}', '${btnId}', undefined, '${rbEsc(g.rs_gear || '')}')"
+                            title="Listen to this gear in isolation"
+                            class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-3 py-1.5 rounded text-xs">▶ Listen</button>`;
     }
-    const t3kLink = g.tone3000_url
-        ? `<a href="${rbEsc(g.tone3000_url)}" target="_blank" title="Ver en tone3000" class="text-xs text-gray-500 hover:text-gray-300 flex-shrink-0">↗</a>` : '';
-
-    // VST panel — same UX as in the per-song view, but uses bulk-assign via
-    // /vst/assign (writes the choice to EVERY preset_piece for this gear).
-    const vstPanelId = `rb-cat-vst-${g.rs_gear.replace(/[^a-zA-Z0-9_-]/g,'_')}`;
-    const knownCount = rbState.knownVsts ? rbState.knownVsts.length : 0;
-
-    // Amp gain variants button — only on amps. Opens the multi-NAM
-    // picker where the curator can map distinct captures to gain
-    // ranges (clean/crunch/dist), with a per-row capture dropdown for
-    // tone3000 pages that host multiple captures.
-    const safeId = g.rs_gear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    // tone3000 link → small icon in the card header, not a competing
+    // button. Reduces the action-row noise.
+    const t3kHeaderLink = g.tone3000_url
+        ? `<a href="${rbEsc(g.tone3000_url)}" target="_blank" onclick="event.stopPropagation()"
+              title="View on tone3000" aria-label="View on tone3000"
+              class="text-gray-500 hover:text-accent text-base px-1 leading-none">↗</a>` : '';
     const variantsBtn = g.category === 'amp' ? `
-        <button onclick="rbToggleAmpVariants('${rbEsc(g.rs_gear)}')"
-                title="Set clean / crunch / dist captures so the song's Gain knob picks the right one"
-                class="bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-300 border border-emerald-800/40 px-2.5 py-1 rounded text-xs">🎚 Variants</button>` : '';
+        <button onclick="event.stopPropagation(); rbToggleAmpVariants('${rbEsc(g.rs_gear)}')"
+                title="Map clean / crunch / dist captures so the song's Gain knob picks the right one"
+                class="bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-300 border border-emerald-800/40 px-3 py-1.5 rounded text-xs">🎚 Variants</button>` : '';
+    const libraryBtn = `<button onclick="event.stopPropagation(); rbToggleCatalogLibrary('${rbEsc(g.rs_gear)}','${rbEsc(g.category || '')}','${rbEsc(g.vst_path || '')}','${rbEsc(g.vst_format || 'VST3')}')"
+                                title="Pick a downloaded NAM/IR or an installed VST/AU and bulk-assign to every preset using this gear"
+                                class="bg-indigo-900/30 hover:bg-indigo-900/50 text-indigo-300 border border-indigo-800/40 px-3 py-1.5 rounded text-xs">📚 Library</button>`;
+    const searchBtn = `<button onclick="event.stopPropagation(); rbOpenSuggest('${rbEsc(g.rs_gear)}')"
+                                title="Search tone3000 for more candidate captures for this gear"
+                                class="text-gray-400 hover:text-gray-200 text-xs px-2 py-1.5">🔍 Search tone3000</button>`;
 
-    // Audition row for amps with curated gain_variants — one mini ▶
-    // per variant (clean/crunch/dist/whatever the curator named them).
-    // Lets the user A/B the 3 captures without opening a song. The
-    // backend stamps `available: false` on variants whose NAM file is
-    // missing on disk; those render as a dimmed button.
+    // Audition row for curated multi-NAM amps — one mini ▶ per variant
+    // (clean/crunch/dist). A/B the captures without leaving the catalog.
     let variantAuditionRow = '';
     if (Array.isArray(g.variants) && g.variants.length) {
         const btns = g.variants.map(v => {
@@ -5016,38 +5911,105 @@ function rbRenderCatalogCard(g) {
                 return `<button disabled title="NAM not downloaded — Setup → Download all curated variants"
                                 class="text-[10px] px-2 py-0.5 rounded bg-dark-800/50 text-gray-600 cursor-not-allowed">▶ ${rbEsc(v.level)}</button>`;
             }
-            return `<button id="${vId}" onclick="rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}')"
-                            title="${rbEsc(v.notes || v.level)}"
+            // Per-level perceptual trim: clean=1.0, crunch=0.71 (-3 dB),
+            // dist=0.50 (-6 dB). Layers on top of the backend's LUFS
+            // normalization to compensate for the harmonic-density boost
+            // distortion captures get beyond integrated loudness.
+            const trim = rbAuditionGainForVariantLevel(v.level);
+            return `<button id="${vId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(v.file).replace(/'/g,"\\'")}','nam','${vId}',${trim},'${rbEsc(g.rs_gear || '')}')"
+                            title="${rbEsc(v.notes || v.level)} — A/B level-matched (${(20 * Math.log10(trim)).toFixed(0)} dB trim)"
                             class="text-[10px] px-2 py-0.5 rounded bg-emerald-900/30 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/40">▶ ${rbEsc(v.level)}</button>`;
         }).join(' ');
-        variantAuditionRow = `<div class="flex items-center gap-1 flex-wrap pl-[3.75rem]">
-            <span class="text-[10px] text-gray-500">variants:</span>${btns}
+        variantAuditionRow = `<div class="flex items-center gap-1 flex-wrap">
+            <span class="text-[10px] text-gray-500">A/B variants:</span>${btns}
         </div>`;
     }
 
-    return `
-        <div class="bg-dark-700/50 border border-gray-800/50 rounded-lg p-3 flex flex-col gap-2">
-            <div class="flex items-center gap-3">
-                ${img}
-                <div class="min-w-0 flex-1">
-                    <div class="text-gray-200 truncate">${rbEsc(g.real_name)}</div>
-                    <div class="text-xs text-gray-500 truncate">${rbEsc(g.rs_gear)}</div>
-                    <div class="text-xs mt-0.5 truncate">${parent}</div>
-                </div>
-                <div class="flex items-center gap-2 flex-shrink-0">
-                    ${t3kLink}${listenBtn}
-                    <button onclick="rbOpenSuggest('${rbEsc(g.rs_gear)}')"
-                            class="bg-dark-600 hover:bg-dark-500 text-gray-200 px-2.5 py-1 rounded text-xs">Search</button>
-                    <button onclick="rbToggleCatalogLibrary('${rbEsc(g.rs_gear)}','${rbEsc(g.category || '')}','${rbEsc(g.vst_path || '')}','${rbEsc(g.vst_format || 'VST3')}')"
-                            title="Pick a downloaded NAM/IR or an installed VST/AU and bulk-assign to every preset using this gear"
-                            class="bg-indigo-900/30 hover:bg-indigo-900/50 text-indigo-300 border border-indigo-800/40 px-2.5 py-1 rounded text-xs">📚 Library</button>
-                    ${variantsBtn}
-                </div>
-            </div>
+    // Audition row for cabs: one ▶ per mic position resolved from the
+    // Wwise HIRC. Sky-blue tone to distinguish from amp variants. The
+    // labels come from the gear manifest's Category field (e.g.
+    // "Dynamic Cone") so the user reads "Dynamic close" / "Condenser
+    // edge" instead of generic "IR 0/1/2/…". Each variant is a
+    // standalone IR — auditioning loads only that .wav, no chain.
+    let micVariantAuditionRow = '';
+    if (Array.isArray(g.mic_variants) && g.mic_variants.length) {
+        const btns = g.mic_variants.map(v => {
+            const vId = `rb-aud-${_rbCatalogSeq++}`;
+            if (!v.available || !v.ir_file) {
+                return `<button disabled title="IR not extracted — re-run Setup → Extract everything"
+                                class="text-[10px] px-2 py-0.5 rounded bg-dark-800/50 text-gray-600 cursor-not-allowed">▶ ${rbEsc(v.label || v.suffix)}</button>`;
+            }
+            return `<button id="${vId}" onclick="event.stopPropagation(); rbAuditionFile('${rbEsc(v.ir_file).replace(/'/g,"\\'")}','ir','${vId}')"
+                            title="${rbEsc(v.mic_type || '')} · ${rbEsc(v.position || '')} (suffix ${rbEsc(v.suffix)})"
+                            class="text-[10px] px-2 py-0.5 rounded bg-sky-900/30 hover:bg-sky-900/60 text-sky-300 border border-sky-800/40">▶ ${rbEsc(v.label || v.suffix)}</button>`;
+        }).join(' ');
+        micVariantAuditionRow = `<div class="flex items-center gap-1 flex-wrap">
+            <span class="text-[10px] text-gray-500">Mic positions:</span>${btns}
+        </div>`;
+    }
+
+    // Layout (expanded):
+    //   1. Current assignment line (what's loaded now)
+    //   2. A/B variant audition row (the most useful interactive bit on
+    //      amp cards — promoted to the TOP so the user can sample
+    //      without scrolling past 5 buttons)
+    //   3. Mic-position row (cabs)
+    //   4. Primary actions: ▶ Listen · 🎛 Edit (VSTs) · 🎚 Variants (amps)
+    //      · 📚 Library
+    //   5. Secondary: 🔍 Search (small, low-contrast)
+    //   6. Sub-panels — stopPropagation on the wrapper so any click
+    //      inside (input, list item, dropdown) doesn't bubble up to
+    //      the card's collapse handler. That was the bug where opening
+    //      Library/Variants and then touching the panel collapsed it.
+    const actionsPanel = expanded ? `
+        <div class="border-t border-gray-800/50 mt-2 pt-2 space-y-2"
+             onclick="event.stopPropagation()">
+            ${assignedLine}
             ${variantAuditionRow}
+            ${micVariantAuditionRow}
+            <div class="flex flex-wrap items-center gap-1.5">
+                ${listenBtn}
+                ${editBtn}
+                ${variantsBtn}
+                ${libraryBtn}
+                <div class="flex-1"></div>
+                ${searchBtn}
+            </div>
             <div id="rb-cat-lib-${safeId}" class="hidden bg-indigo-900/10 border border-indigo-800/30 rounded p-2"></div>
             <div id="rb-cat-variants-${safeId}" class="hidden bg-emerald-900/10 border border-emerald-800/30 rounded p-2"></div>
+        </div>` : '';
+
+    const chevron = expanded ? '▼' : '▶';
+    const cardHighlight = expanded
+        ? 'border-accent/40 bg-dark-700/70'
+        : 'border-gray-800/50 bg-dark-700/40 hover:border-gray-700 hover:bg-dark-700/60';
+
+    return `
+        <div onclick="rbToggleGearCard('${rbEsc(g.rs_gear)}')"
+             class="cursor-pointer border rounded-lg p-3 transition ${cardHighlight}">
+            <div class="flex items-start gap-3">
+                ${photoBlock}
+                <div class="min-w-0 flex-1">
+                    <div class="text-gray-100 font-medium leading-tight break-words" title="${rbEsc(g.real_name)}">${rbEsc(g.real_name)}</div>
+                    <div class="text-[11px] text-gray-500 font-mono break-all">${rbEsc(g.rs_gear)}</div>
+                </div>
+                <div class="flex items-center gap-1 flex-shrink-0 mt-0.5">
+                    ${t3kHeaderLink}
+                    <span class="text-gray-500 text-xs select-none" aria-hidden="true">${chevron}</span>
+                </div>
+            </div>
+            ${actionsPanel}
         </div>`;
+}
+
+// Toggle the expanded state for one gear. Re-renders the catalog so
+// the action panel materializes (or collapses). The expanded set is
+// persisted on rbState so a tab switch and back keeps the panel open.
+function rbToggleGearCard(rsGear) {
+    if (!rbState.gearExpanded) rbState.gearExpanded = new Set();
+    if (rbState.gearExpanded.has(rsGear)) rbState.gearExpanded.delete(rsGear);
+    else rbState.gearExpanded.add(rsGear);
+    rbApplyGearFilters();
 }
 
 // Toggle + render the Gain-variants panel for an amp in the Gear catalog.
@@ -5061,6 +6023,11 @@ async function rbToggleAmpVariants(rsGear) {
         el.classList.add('hidden');
         return;
     }
+    // Mutual exclusivity: opening Variants closes Library (and vice versa).
+    // Sibling panels under the same card would otherwise stack up vertically
+    // and the user wouldn't see the one they just clicked.
+    const libEl = document.getElementById(`rb-cat-lib-${safeId}`);
+    if (libEl) libEl.classList.add('hidden');
     el.classList.remove('hidden');
     el.innerHTML = `<div class="text-xs text-gray-500">Loading…</div>`;
     try {
@@ -5081,36 +6048,79 @@ function rbRenderAmpVariantsPanel(rsGear, data) {
     const variants = data.variants || {};
     const defaults = data.default_levels || {};
     const levels = ['clean', 'crunch', 'dist'];
+
+    // Quick mode header: paste ONE tone3000 link, "Load captures", and
+    // every level row gets the same dropdown populated below — for the
+    // common case where you want all three variants from the same
+    // capturer's page. Per-level rows still let you override with a
+    // different link if needed (collapsed by default to keep the panel
+    // calm).
+    const quickHeader = `
+        <div class="bg-emerald-900/15 border border-emerald-800/30 rounded p-2.5 mb-3">
+            <div class="text-[11px] text-emerald-300 font-medium mb-1">⚡ Quick — one link for all 3 levels</div>
+            <div class="text-[10px] text-gray-500 mb-2">
+                Paste a tone3000 amp page (URL or ID). After loading, pick
+                one capture per level from the dropdowns below — no need
+                to know what a model_id is.
+            </div>
+            <div class="flex items-center gap-2">
+                <input id="rb-amp-quick-tone-${safeId}" type="text"
+                       placeholder="https://tone3000.com/tones/37987   or just   37987"
+                       class="flex-1 bg-dark-900 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1 font-mono">
+                <button onclick="rbAmpVariantsQuickLoad('${rbEsc(rsGear)}')"
+                        class="bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] px-3 py-1 rounded whitespace-nowrap">⬇ Load captures</button>
+            </div>
+            <div id="rb-amp-quick-status-${safeId}" class="text-[10px] text-gray-500 mt-1.5"></div>
+        </div>`;
+
     const rows = levels.map(level => {
         const v = variants[level] || {};
         const def = defaults[level] || { rs_gain_range: [0, 100] };
         const range = v.rs_gain_range || def.rs_gain_range;
         const tone3000Id = v.tone3000_id || '';
-        const modelId = v.model_id || '';
         const isSaved = !!v.tone3000_id;
+        const captureName = (v.notes || '').trim();
         const slotPrefix = `rb-amp-variants-${safeId}-${level}`;
+        // Saved-state header line: prefer the human capture name
+        // (notes) over the generic "✓ saved". Truncate to keep the row
+        // compact — full text on hover.
+        let savedBadge;
+        if (isSaved) {
+            const shown = captureName ? captureName : `tone3000 #${tone3000Id}`;
+            savedBadge = `<span class="text-[10px] text-emerald-400 truncate max-w-[24rem]"
+                                title="${rbEsc(captureName || ('tone3000 #' + tone3000Id))}">✓ ${rbEsc(shown)}</span>`;
+        } else {
+            savedBadge = '<span class="text-[10px] text-gray-600">empty</span>';
+        }
         return `
             <div class="bg-dark-800/60 border border-gray-800/40 rounded p-2 mb-2" id="${slotPrefix}">
-                <div class="flex items-center justify-between mb-1.5">
-                    <div class="flex items-center gap-2">
+                <div class="flex items-center justify-between gap-2 mb-1.5">
+                    <div class="flex items-center gap-2 min-w-0">
                         <span class="font-semibold text-emerald-300 capitalize">${level}</span>
-                        <span class="text-[10px] text-gray-500">Gain ${range[0]}-${range[1]}</span>
-                        ${isSaved ? '<span class="text-[10px] text-emerald-400">✓ saved</span>' : '<span class="text-[10px] text-gray-600">empty</span>'}
+                        <span class="text-[10px] text-gray-500 whitespace-nowrap">Gain ${range[0]}-${range[1]}</span>
+                        ${savedBadge}
                     </div>
                     ${isSaved ? `<button onclick="rbDeleteAmpVariant('${rbEsc(rsGear)}', '${level}')"
-                                        class="text-[10px] text-red-400 hover:text-red-300 px-1.5 py-0.5">Remove</button>` : ''}
+                                        class="text-[10px] text-red-400 hover:text-red-300 px-1.5 py-0.5 flex-shrink-0">Remove</button>` : ''}
                 </div>
                 <div class="flex items-center gap-2 mb-1.5">
-                    <input id="${slotPrefix}-tone" type="text" placeholder="tone3000 URL or ID (e.g. 37987)"
-                           value="${rbEsc(tone3000Id)}"
-                           class="flex-1 bg-dark-900 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1 font-mono">
-                    <button onclick="rbInspectAmpVariant('${rbEsc(rsGear)}', '${level}')"
-                            class="bg-dark-600 hover:bg-dark-500 text-gray-200 text-[10px] px-2 py-1 rounded whitespace-nowrap">↓ Captures</button>
+                    <span class="text-[10px] text-gray-500 whitespace-nowrap">Capture:</span>
+                    <select id="${slotPrefix}-model"
+                            class="flex-1 bg-dark-900 border border-gray-800 rounded text-[10px] text-gray-200 px-1 py-1"
+                            disabled>
+                        <option value="">(load captures via ⚡ Quick or 🔗 Use a different link)</option>
+                    </select>
                 </div>
-                <div id="${slotPrefix}-captures" class="hidden flex items-center gap-2 mb-1.5">
-                    <span class="text-[10px] text-gray-500">capture:</span>
-                    <select id="${slotPrefix}-model" class="flex-1 bg-dark-900 border border-gray-800 rounded text-[10px] text-gray-200 px-1 py-1"></select>
-                </div>
+                <details class="text-[10px] text-gray-500 mb-1">
+                    <summary class="cursor-pointer hover:text-gray-300 select-none">🔗 Use a different tone3000 link for ${level}</summary>
+                    <div class="flex items-center gap-2 mt-1.5">
+                        <input id="${slotPrefix}-tone" type="text" placeholder="tone3000 URL or ID"
+                               value="${rbEsc(tone3000Id)}"
+                               class="flex-1 bg-dark-900 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1 font-mono">
+                        <button onclick="rbInspectAmpVariant('${rbEsc(rsGear)}', '${level}')"
+                                class="bg-dark-600 hover:bg-dark-500 text-gray-200 text-[10px] px-2 py-1 rounded whitespace-nowrap">⬇ Load</button>
+                    </div>
+                </details>
                 <div class="flex items-center gap-2">
                     <button onclick="rbSaveAmpVariant('${rbEsc(rsGear)}', '${level}')"
                             class="bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] px-2.5 py-1 rounded">💾 Save ${level}</button>
@@ -5120,24 +6130,85 @@ function rbRenderAmpVariantsPanel(rsGear, data) {
     }).join('');
     return `
         <div class="text-xs text-gray-400 mb-2">
-            Each level downloads a separate capture; the song's Gain knob
-            picks which one plays. Leave a level empty to skip it (the
-            closest other variant covers that range).
+            Map a capture to each gain range. The song's Gain knob picks
+            which one plays. Leave a level empty to skip it (the closest
+            variant covers that range).
         </div>
+        ${quickHeader}
         ${rows}`;
 }
 
+// Quick mode: paste one tone3000 link, fetch captures once, populate
+// the dropdown for every level. The user then picks one capture per
+// level and saves. The per-level "Use a different link" override
+// still works on top of this — its own dropdown wins for that level.
+async function rbAmpVariantsQuickLoad(rsGear) {
+    const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const input = document.getElementById(`rb-amp-quick-tone-${safeId}`);
+    const statusEl = document.getElementById(`rb-amp-quick-status-${safeId}`);
+    if (!input || !statusEl) return;
+    const raw = (input.value || '').trim();
+    const m = raw.match(/(\d+)\s*$/);
+    if (!m) {
+        statusEl.textContent = 'enter a tone3000 URL or numeric ID';
+        statusEl.className = 'text-[10px] text-amber-300 mt-1.5';
+        return;
+    }
+    const toneId = parseInt(m[1], 10);
+    statusEl.textContent = 'fetching captures…';
+    statusEl.className = 'text-[10px] text-gray-500 mt-1.5';
+    try {
+        const r = await fetch(`${RB_API}/tone3000/captures/${toneId}`);
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.status);
+        const caps = data.captures || [];
+        if (!caps.length) {
+            statusEl.textContent = 'no captures in this tone';
+            statusEl.className = 'text-[10px] text-amber-300 mt-1.5';
+            return;
+        }
+        // Populate every level's dropdown with the same list. The
+        // model_id is hidden inside the option's value — the user only
+        // sees the capture name + size + license. Each level also
+        // gets a `data-tone-id` so Save knows which tone3000 page this
+        // capture came from (quick mode = shared id; per-level mode
+        // overrides per row).
+        const optsHtml = '<option value="">(pick a capture for this level)</option>' +
+            caps.map(c => {
+                const meta = [c.size || '?', c.license || ''].filter(Boolean).join(' · ');
+                return `<option value="${c.model_id}">${rbEsc(c.name)}${meta ? ` — ${rbEsc(meta)}` : ''}</option>`;
+            }).join('');
+        for (const level of ['clean', 'crunch', 'dist']) {
+            const sel = document.getElementById(`rb-amp-variants-${safeId}-${level}-model`);
+            if (sel) {
+                sel.innerHTML = optsHtml;
+                sel.dataset.toneId = String(toneId);
+                sel.dataset.source = 'quick';
+                sel.disabled = false;
+                // Stash the capture names so Save can record `notes`
+                // (human-readable label) without re-querying the API.
+                sel._rbCaptures = caps;
+            }
+        }
+        statusEl.innerHTML = `<span class="text-emerald-400">✓ ${caps.length} captures loaded — pick one per level and Save</span>`;
+        statusEl.className = 'text-[10px] mt-1.5';
+    } catch (e) {
+        statusEl.textContent = `failed: ${e.message || e}`;
+        statusEl.className = 'text-[10px] text-red-400 mt-1.5';
+    }
+}
+
 // Inspect the captures inside a tone3000 page (GET /tone3000/captures/{id})
-// and populate the per-row dropdown. The "tone3000 URL or ID" input
-// accepts either format — we extract the trailing number from URLs.
+// and populate this LEVEL's dropdown only. Used by the per-level
+// "Use a different link" override; the Quick mode populates all 3
+// dropdowns in one go via rbAmpVariantsQuickLoad.
 async function rbInspectAmpVariant(rsGear, level) {
     const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
     const slotPrefix = `rb-amp-variants-${safeId}-${level}`;
     const input = document.getElementById(`${slotPrefix}-tone`);
     const statusEl = document.getElementById(`${slotPrefix}-status`);
-    const capsRow = document.getElementById(`${slotPrefix}-captures`);
     const select  = document.getElementById(`${slotPrefix}-model`);
-    if (!input || !statusEl || !capsRow || !select) return;
+    if (!input || !statusEl || !select) return;
     const raw = (input.value || '').trim();
     const m = raw.match(/(\d+)\s*$/);
     if (!m) {
@@ -5156,22 +6227,21 @@ async function rbInspectAmpVariant(rsGear, level) {
         if (!caps.length) {
             statusEl.textContent = 'no captures in this tone';
             statusEl.className = 'text-[10px] text-amber-300';
-            capsRow.classList.add('hidden');
             return;
         }
-        // Build options. Add a sentinel "(auto: best by size)" at top
-        // so the user can explicitly let pick_best_model decide.
-        //
-        // Order matters here: the capture's title (which encodes knob
+        // Order matters: the capture's title (which encodes knob
         // settings like "G7 B5 M5 T5 P5 V5") is what the user reads to
         // match a Rocksmith gain level — put it first. Size/license
-        // are secondary metadata tail-tagged at the end.
-        select.innerHTML = `<option value="">(auto: best by size)</option>` +
+        // are secondary metadata tail-tagged.
+        select.innerHTML = `<option value="">(pick a capture for this level)</option>` +
             caps.map(c => {
                 const meta = [c.size || '?', c.license || ''].filter(Boolean).join(' · ');
-                return `<option value="${c.model_id}">${rbEsc(c.name)} — ${rbEsc(meta)}</option>`;
+                return `<option value="${c.model_id}">${rbEsc(c.name)}${meta ? ` — ${rbEsc(meta)}` : ''}</option>`;
             }).join('');
-        capsRow.classList.remove('hidden');
+        select.dataset.toneId = String(toneId);
+        select.dataset.source = 'custom';
+        select.disabled = false;
+        select._rbCaptures = caps;
         statusEl.textContent = `${caps.length} capture${caps.length === 1 ? '' : 's'} loaded — pick one and Save`;
         statusEl.className = 'text-[10px] text-emerald-400';
     } catch (e) {
@@ -5181,29 +6251,48 @@ async function rbInspectAmpVariant(rsGear, level) {
 }
 
 // Persist a single variant. POSTs to /amp_variants/{rs_gear}/{level}.
+// Picks tone3000_id from the SELECT's dataset (Quick mode + per-level
+// both stash it there) so we don't depend on the per-level URL input
+// being filled — Quick mode users never touched that field.
 async function rbSaveAmpVariant(rsGear, level) {
     const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
     const slotPrefix = `rb-amp-variants-${safeId}-${level}`;
-    const input = document.getElementById(`${slotPrefix}-tone`);
     const select = document.getElementById(`${slotPrefix}-model`);
     const statusEl = document.getElementById(`${slotPrefix}-status`);
-    if (!input || !statusEl) return;
-    const raw = (input.value || '').trim();
-    const m = raw.match(/(\d+)\s*$/);
-    if (!m) {
-        statusEl.textContent = 'enter a tone3000 URL or numeric ID first';
+    if (!select || !statusEl) return;
+    const toneIdStr = (select.dataset && select.dataset.toneId) || '';
+    if (!toneIdStr) {
+        statusEl.textContent = 'load captures first (⚡ Quick or 🔗 different link)';
         statusEl.className = 'text-[10px] text-amber-300';
         return;
     }
-    const tone3000Id = parseInt(m[1], 10);
-    const modelId = (select && select.value) ? parseInt(select.value, 10) : null;
+    const tone3000Id = parseInt(toneIdStr, 10);
+    const modelId = (select.value) ? parseInt(select.value, 10) : null;
+    if (!modelId) {
+        statusEl.textContent = 'pick a capture from the dropdown first';
+        statusEl.className = 'text-[10px] text-amber-300';
+        return;
+    }
+    // Find the chosen capture's human name and pass it as `notes` so
+    // the saved-row badge shows "✓ G3 B5 M5 T5 P5 V5" instead of just
+    // "✓ saved". Falls back gracefully if the capture metadata isn't
+    // attached to the SELECT for any reason.
+    let notes = '';
+    const caps = select._rbCaptures || [];
+    const match = caps.find(c => String(c.model_id) === String(modelId));
+    if (match && match.name) notes = match.name;
+
     statusEl.textContent = 'saving…';
     statusEl.className = 'text-[10px] text-gray-500';
     try {
         const r = await fetch(`${RB_API}/amp_variants/${encodeURIComponent(rsGear)}/${encodeURIComponent(level)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tone3000_id: tone3000Id, model_id: modelId }),
+            body: JSON.stringify({
+                tone3000_id: tone3000Id,
+                model_id: modelId,
+                notes: notes,
+            }),
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || r.status);
@@ -5245,12 +6334,22 @@ function rbReopenAmpVariants(rsGear) {
     rbToggleAmpVariants(rsGear);
 }
 
+// (catalog-level bulk Replace removed: the Gear tab no longer exposes
+// a global swap. Per-song gear swapping lives in the Songs editor's
+// 🔁 Swap button — the backend POST /gear/replace_with endpoint still
+// supports both modes, the UI just doesn't surface the global one.)
+
 // Open the catalog-card library picker (bulk-assigns to every preset using
 // this rs_gear_type). `category` tells us whether to list NAMs or IRs.
 async function rbToggleCatalogLibrary(rsGear, category, vstPath, vstFormat) {
     const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
     const el = document.getElementById(`rb-cat-lib-${safeId}`);
     if (!el) return;
+    // Mutual exclusivity with the Variants panel (sibling under the
+    // same card) — opening Library closes Variants so the user only
+    // sees the one they just clicked.
+    const varEl = document.getElementById(`rb-cat-variants-${safeId}`);
+    if (varEl) varEl.classList.add('hidden');
     el.classList.toggle('hidden');
     if (el.classList.contains('hidden')) return;
     if (el.dataset.built === '1') return;
@@ -5297,6 +6396,12 @@ async function rbCatLibTab(rsGear, tab) {
     if (el.dataset.filesLoaded !== '1') {
         content.innerHTML = `<div class="text-xs text-gray-500">loading library…</div>`;
         try {
+            // Fetch the whole bucket for this `kind` (no `category` query
+            // param) so the picker can show NAMs/IRs from EVERY subdir
+            // grouped together. The user might want to assign an amp NAM
+            // to a pedal slot (or vice versa) for experimentation — the
+            // category-restricted version blocked that. Defaults to the
+            // current gear's category being expanded; others collapsed.
             const r = await fetch(`${RB_API}/local_files?kind=${kind}`);
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const data = await r.json();
@@ -5311,6 +6416,29 @@ async function rbCatLibTab(rsGear, tab) {
     rbRenderCatalogLibraryList(content, el._rbAllFiles, rsGear, kind, '');
 }
 
+// Friendly labels for the subdir categories the v1.2 storage layout
+// uses. Anything not matching one of these (legacy flat files, RS-
+// extracted IRs under rocksmith/, etc.) lands in the appropriate
+// "other" bucket per kind.
+const _RB_LIB_CATEGORY_LABEL = {
+    amps:      '🎚 Amps',
+    pedals:    '🎛 Pedals',
+    racks:     '📦 Racks',
+    cabs:      '🔊 Cabs',
+    rocksmith: '🎮 Rocksmith IRs',
+    other:     '… Other',
+};
+
+// Pick the bucket for a relative filename based on its subdir prefix.
+// Falls back to "other" when no subdir is present (legacy flat layout)
+// or the subdir isn't one we know about.
+function rbLibBucketFor(name) {
+    const i = name.indexOf('/');
+    if (i < 0) return 'other';
+    const head = name.slice(0, i);
+    return (head in _RB_LIB_CATEGORY_LABEL) ? head : 'other';
+}
+
 function rbRenderCatalogLibraryList(container, files, rsGear, kind, filter) {
     const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
     const inputId = `rb-cat-lib-search-${safeId}`;
@@ -5318,7 +6446,7 @@ function rbRenderCatalogLibraryList(container, files, rsGear, kind, filter) {
     const rowsId  = `rb-cat-lib-rows-${safeId}`;
     container.innerHTML = `
         <div class="text-[10px] text-indigo-300 mb-1">
-            Pick from your downloaded ${kind === 'ir' ? 'IRs' : 'NAMs'} · click "Use for all" to apply to every preset using <code>${rbEsc(rsGear)}</code>
+            Pick from your downloaded ${kind === 'ir' ? 'IRs' : 'NAMs'} · "Use for all" applies to every preset using <code>${rbEsc(rsGear)}</code>
         </div>
         <div class="flex items-center gap-2 mb-2">
             <input id="${inputId}" type="text" placeholder="🔍 Filter…"
@@ -5327,7 +6455,7 @@ function rbRenderCatalogLibraryList(container, files, rsGear, kind, filter) {
                    class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-200 px-2 py-1">
             <span id="${countId}" class="text-[10px] text-gray-500">${files.length}/${files.length}</span>
         </div>
-        <div id="${rowsId}" class="max-h-64 overflow-y-auto"></div>`;
+        <div id="${rowsId}" class="max-h-72 overflow-y-auto"></div>`;
     rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter);
 }
 
@@ -5342,7 +6470,41 @@ function rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter) {
         : files;
     const titleCounts = {};
     filtered.forEach(x => { if (x.title) titleCounts[x.title] = (titleCounts[x.title] || 0) + 1; });
-    const rows = filtered.slice(0, 50).map(file => {
+    // Group files by subdir bucket — keeps the picker readable when
+    // the user has hundreds of files spread across categories.
+    const buckets = {};
+    for (const file of filtered) {
+        const b = rbLibBucketFor(file.name);
+        (buckets[b] = buckets[b] || []).push(file);
+    }
+    // Render order is intent-aware: the current gear's category first
+    // (expanded by default), then the rest in the canonical order
+    // amps → pedals → racks → cabs → rocksmith → other.
+    const containerEl = document.getElementById(`rb-cat-lib-${safeId}`);
+    const currentCat = (containerEl && containerEl._rbCategory) || '';
+    const currentBucket = (
+        currentCat === 'amp' ? 'amps' :
+        currentCat === 'pedal' ? 'pedals' :
+        currentCat === 'rack' ? 'racks' :
+        currentCat === 'cab' ? 'cabs' : null
+    );
+    const canonOrder = ['amps', 'pedals', 'racks', 'cabs', 'rocksmith', 'other'];
+    const orderedBuckets = [
+        ...(currentBucket && buckets[currentBucket] ? [currentBucket] : []),
+        ...canonOrder.filter(b => b !== currentBucket && buckets[b]),
+    ];
+    // Track open/closed sections on the container so re-rendering on
+    // filter input preserves what the user expanded. By default the
+    // current-category bucket is open; the rest are collapsed unless
+    // there's an active filter (then everything stays open so
+    // matches are visible).
+    if (!containerEl._rbBucketOpen) {
+        containerEl._rbBucketOpen = {};
+        for (const b of orderedBuckets) {
+            containerEl._rbBucketOpen[b] = (b === currentBucket);
+        }
+    }
+    const renderRow = (file) => {
         const usedBadge = file.use_count > 0
             ? `<span class="text-[10px] text-amber-300/80" title="${rbEsc((file.used_for_gears || []).join(', '))}">used ${file.use_count}×</span>`
             : `<span class="text-[10px] text-gray-600">unused</span>`;
@@ -5358,12 +6520,41 @@ function rbRenderCatalogLibraryRows(container, files, rsGear, kind, filter) {
                         title="Apply to every preset using ${rbEsc(rsGear)}"
                         class="bg-indigo-700 hover:bg-indigo-600 text-white text-[10px] px-2 py-0.5 rounded">Use for all</button>
             </div>`;
+    };
+    const groupsHtml = orderedBuckets.map(b => {
+        const list = buckets[b];
+        // With an active filter, expand all matching buckets so the
+        // user sees what they searched for.
+        const open = f ? true : !!containerEl._rbBucketOpen[b];
+        const label = _RB_LIB_CATEGORY_LABEL[b] || b;
+        const isCurrent = (b === currentBucket);
+        const rows = list.slice(0, 50).map(renderRow).join('');
+        const moreNote = list.length > 50
+            ? `<div class="text-[10px] text-gray-500 italic px-2 py-0.5">…and ${list.length - 50} more in this category (refine search)</div>`
+            : '';
+        return `
+            <details ${open ? 'open' : ''}
+                     onclick="event.stopPropagation()"
+                     ontoggle="rbCatLibToggleBucket('${rbEsc(rsGear)}','${rbEsc(b)}', this.open)"
+                     class="mb-1">
+                <summary class="cursor-pointer select-none px-2 py-1 text-[11px] ${isCurrent ? 'text-indigo-300 font-semibold' : 'text-gray-400'} hover:text-gray-200">
+                    ${label} <span class="text-gray-600">(${list.length})</span>${isCurrent ? ' <span class="text-[9px] text-indigo-400">· this gear&apos;s category</span>' : ''}
+                </summary>
+                ${rows}${moreNote}
+            </details>`;
     }).join('');
-    const moreNote = filtered.length > 50
-        ? `<div class="text-[10px] text-gray-500 italic mt-1">…and ${filtered.length - 50} more (refine search)</div>`
-        : '';
-    rowsEl.innerHTML = (rows || '<div class="text-xs text-gray-500 italic">no matches</div>') + moreNote;
+    rowsEl.innerHTML = groupsHtml || '<div class="text-xs text-gray-500 italic">no matches</div>';
     if (countEl) countEl.textContent = `${filtered.length}/${files.length}`;
+}
+
+// Persist which buckets the user expanded/collapsed so a filter
+// re-render doesn't reset their open state.
+function rbCatLibToggleBucket(rsGear, bucket, isOpen) {
+    const safeId = rsGear.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const el = document.getElementById(`rb-cat-lib-${safeId}`);
+    if (!el) return;
+    el._rbBucketOpen = el._rbBucketOpen || {};
+    el._rbBucketOpen[bucket] = !!isOpen;
 }
 
 function rbFilterCatalogLibrary(rsGear) {
@@ -5423,66 +6614,60 @@ function rbRenderCatalogVstPanelBody(panelId, rsGear, currentVstPath, currentFor
     const el = document.getElementById(panelId);
     const stagedPath = (el && el.dataset.stagedPath) || currentVstPath || '';
     const stagedName = stagedPath ? stagedPath.split('/').pop() : '(none selected)';
+
+    // Plugin selector. Two flavours:
+    //   - Scanned VSTs exist → single dropdown with a tiny "hide
+    //     instruments" toggle. No separate search input — the dropdown
+    //     already filters by name when you start typing in many
+    //     browsers, and the per-row knob editor lives in the per-song
+    //     editor anyway.
+    //   - No scan yet → hint to use Pick file. The file picker is the
+    //     scan-less path.
     let pluginSelector;
     if (known.length === 0) {
         pluginSelector = `
-            <div class="text-xs text-gray-400">
-                No plugins scanned yet — scan in <span class="text-gray-300">Settings → VST / Audio Unit plugins</span>, or use 📁 Pick file below.
+            <div class="text-[11px] text-gray-400">
+                No plugins scanned yet — scan in <span class="text-gray-300">Settings → VST / Audio Unit plugins</span>,
+                or use 📁 Pick file below.
             </div>`;
     } else {
         const selId = `${panelId}-select`;
         const opts = rbBuildVstOptions(stagedPath, '', true);
         pluginSelector = `
-            <div class="flex items-center gap-2 mb-1">
-                <input id="${selId}-search" type="text" placeholder="🔍 filter by name / brand / category"
-                       oninput="rbFilterVstSelect('${rbEsc(selId)}')"
-                       class="flex-1 bg-dark-900 border border-gray-800 rounded text-xs text-gray-200 px-2 py-1">
+            <div class="flex items-center gap-2">
+                <select id="${selId}" data-staged="${rbEsc(stagedPath)}"
+                        onchange="rbCatalogStagePath('${rbEsc(panelId)}', this.value)"
+                        class="flex-1 bg-dark-800 border border-gray-800 rounded text-xs text-gray-200 px-2 py-1">${opts}</select>
                 <label class="text-[10px] text-gray-400 flex items-center gap-1 whitespace-nowrap">
                     <input id="${selId}-hideinst" type="checkbox" checked
                            onchange="rbFilterVstSelect('${rbEsc(selId)}')"> hide instruments
                 </label>
-            </div>
-            <select id="${selId}" data-staged="${rbEsc(stagedPath)}"
-                    onchange="rbCatalogStagePath('${rbEsc(panelId)}', this.value)"
-                    class="w-full bg-dark-800 border border-gray-800 rounded text-xs text-gray-200 px-2 py-1">${opts}</select>`;
+            </div>`;
     }
     return `
-        <div class="text-xs text-purple-300 font-semibold">VST3 / Audio Unit</div>
+        <div class="text-xs text-purple-300 font-semibold mb-1">VST3 / Audio Unit</div>
         ${pluginSelector}
-        <div class="flex items-center gap-2 flex-wrap">
+        <div class="flex items-center gap-2 flex-wrap mt-2">
             <button onclick="rbCatalogPickFile('${rbEsc(panelId)}','${rbEsc(rsGear)}','${rbEsc(currentFormat)}')"
-                    title="File picker — bypass scan entirely"
-                    class="bg-emerald-700 hover:bg-emerald-600 text-white text-xs px-2 py-1 rounded">
+                    title="Browse to a .vst3 / .component bundle"
+                    class="bg-dark-700 hover:bg-dark-600 text-gray-200 text-xs px-2 py-1 rounded">
                 📁 Pick file
             </button>
-        </div>
-        <div class="flex items-center gap-2">
             <input id="${panelId}-pathinput" type="text"
-                   placeholder="Or paste path: /Library/Audio/Plug-Ins/VST3/TAL-Chorus-LX.vst3 (or .component for AU)"
+                   placeholder="or paste path…"
                    value="${rbEsc(stagedPath)}"
                    onchange="rbCatalogUpdatePathFromInput('${rbEsc(panelId)}','${rbEsc(rsGear)}', this.value)"
-                   class="flex-1 bg-dark-800 border border-gray-800 rounded text-[11px] text-gray-300 px-2 py-1 font-mono">
+                   class="flex-1 bg-dark-800 border border-gray-800 rounded text-[10px] text-gray-400 px-2 py-1 font-mono">
         </div>
-        <div id="${panelId}-selected" class="text-[10px] text-purple-200/80 break-all">Selected: ${rbEsc(stagedName)}</div>
-        <div class="text-[10px] text-gray-500 leading-snug">
-            The text input above wins over the dropdown — pasting a full path overrides any scanned plugin selection. <code>.component</code> (Audio Units) and <code>.vst3</code> both work.
-        </div>
-        <div class="flex items-center gap-2 flex-wrap">
-            <button onclick="rbCatalogLoadAndEdit('${rbEsc(panelId)}')"
-                    class="bg-blue-700 hover:bg-blue-600 text-white text-xs px-2 py-1 rounded">
-                ▶ Load &amp; Edit
-            </button>
-            <button onclick="rbCatalogCaptureState('${rbEsc(panelId)}')"
-                    title="Capture current parameter state from the engine"
-                    class="bg-amber-700/60 hover:bg-amber-600/60 text-amber-100 text-xs px-2 py-1 rounded">
-                📸 Capture state
-            </button>
+        <div id="${panelId}-selected" class="text-[10px] text-purple-200/80 break-all mt-1">Selected: ${rbEsc(stagedName)}</div>
+        <div class="mt-2">
             <button onclick="rbCatalogAssignVst('${rbEsc(panelId)}','${rbEsc(rsGear)}')"
-                    class="bg-purple-700 hover:bg-purple-600 text-white text-xs px-2 py-1 rounded">
-                ✓ Assign to ALL ${rbEsc(rsGear)}
+                    class="bg-purple-700 hover:bg-purple-600 text-white text-xs px-3 py-1.5 rounded">
+                ✓ Use this plugin for ${rbEsc(rsGear)}
             </button>
+            <span class="text-[10px] text-gray-500 ml-2">Per-song knob tweaks happen in the Songs editor.</span>
         </div>
-        <div id="${panelId}-status" class="text-[10px] text-gray-500"></div>`;
+        <div id="${panelId}-status" class="text-[10px] text-gray-500 mt-1"></div>`;
 }
 
 function rbCatalogStagePath(panelId, path) {
@@ -5666,6 +6851,115 @@ async function rbLoadCatalogVstSuggestions(rsGearType, panelId) {
 
 // Audition a VST in isolation (catalog row ▶). Mirrors rbAuditionFile but for
 // stage type 0 (VST) instead of 1 (NAM) / 2 (IR).
+// Direct "edit this VST" from the Gear catalog — loads the plugin into a
+// throwaway slot and pops the native editor window. Saves the "📚 Library
+// → re-pick the same VST → open editor" detour once a gear already has a
+// VST assigned. Stops any other preview/audition first and closes any
+// open VST editor window (orphaned windows are the known crash trigger).
+// DIAGNOSTIC — sweep one param across [0..1] in N steps to discover the
+// display→normalized mapping (especially for stepped/enum params whose
+// step layout isn't documented). User invokes from DevTools console:
+//   await window.rbSweepParam(slot, 'Type')             // 21 steps
+//   await window.rbSweepParam(slot, 'Type', 51)         // 51 steps for fine detail
+// Reads the `text` field returned by getParameters at each value — that's
+// the display string the plugin uses (e.g. "Saturate" / "Hard Clip").
+// Logs one line per UNIQUE display value with its normalized range.
+// Use after a freshly-loaded VST so you know the slot id (returned by
+// loadVST, also visible in [rig_builder restore] logs).
+window.rbSweepParam = async function (slotId, paramName, steps) {
+    const api = window.slopsmithDesktop && window.slopsmithDesktop.audio;
+    if (!api || typeof api.setParameter !== 'function' || typeof api.getParameters !== 'function') {
+        console.error('[rb-sweep] No audio API or missing setParameter / getParameters'); return;
+    }
+    const params = await api.getParameters(slotId);
+    if (!Array.isArray(params)) { console.error('[rb-sweep] getParameters returned non-array'); return; }
+    const target = params.find(p => (p.name || p.label || '').toLowerCase() === String(paramName).toLowerCase());
+    if (!target) {
+        console.error(`[rb-sweep] No param named "${paramName}". Available:`, params.map(p => p.name || p.label).slice(0, 30));
+        return;
+    }
+    const pid = target.id ?? target.paramId ?? target.index;
+    const N = Math.max(2, parseInt(steps || 21, 10));
+    console.log(`[rb-sweep] slot=${slotId} param "${paramName}" (id=${pid}) — sweeping ${N} points from 0.0 to 1.0`);
+    const rows = [];
+    for (let i = 0; i < N; i++) {
+        const v = i / (N - 1);
+        await api.setParameter(slotId, pid, v);
+        // Re-fetch the single param so `text` reflects post-set display.
+        const fresh = await api.getParameters(slotId);
+        const cur = fresh.find(p => (p.id ?? p.paramId ?? p.index) === pid);
+        const text = cur ? (cur.text ?? cur.display ?? '<no-text>') : '<missing>';
+        rows.push({ v: v.toFixed(3), text });
+    }
+    // Collapse adjacent rows with the same text into ranges.
+    const ranges = [];
+    let runStart = rows[0]; let last = rows[0];
+    for (let i = 1; i < rows.length; i++) {
+        if (rows[i].text !== last.text) {
+            ranges.push({ from: runStart.v, to: last.v, text: last.text });
+            runStart = rows[i];
+        }
+        last = rows[i];
+    }
+    ranges.push({ from: runStart.v, to: last.v, text: last.text });
+    console.log(`[rb-sweep] "${paramName}" display mapping (${ranges.length} unique values):`);
+    ranges.forEach(r => console.log(`    [${r.from} .. ${r.to}]  →  ${r.text}`));
+    return ranges;
+};
+
+async function rbCatalogEditVst(vstPath, vstFormat, rsGear) {
+    const api = rbNativeAudio();
+    if (!api || typeof api.loadVST !== 'function') {
+        alert('Native VST hosting not available.');
+        return;
+    }
+    try {
+        await rbCloseActiveVstEditor();
+        if (rbState.listeningTone !== null || rbState._auditionId) {
+            await rbStopPreview();
+        }
+        if (api.clearChain) await api.clearChain().catch(() => {});
+        const wasRunning = api.isAudioRunning ? await api.isAudioRunning().catch(() => true) : true;
+        if (!wasRunning) await api.startAudio().catch(() => {});
+        const slotId = await api.loadVST(vstPath);
+        if (slotId == null || slotId < 0) {
+            alert(`Engine refused to load this plugin:\n${vstPath}`);
+            return;
+        }
+        rbState._vstEditorSlot = slotId;
+        // Apply the (gear, vst) `_static` defaults if any — pinned params
+        // curated in rs_knob_to_vst_param.json (e.g. kHs Distortion's
+        // Mode + Dynamics for fuzz/od/dist subtypes). Without this, the
+        // Edit button shows the plugin's defaults regardless of subtype,
+        // and the user can't preview what a fuzz-vs-overdrive default
+        // sounds like. RS-knob translations are NOT applied here (catalog
+        // is gear-level, no per-tone knob values).
+        if (rsGear) {
+            const vstStem = vstPath.split('/').pop().replace(/\.(vst3|component)$/i, '').toLowerCase();
+            try {
+                const r = await fetch(`${RB_API}/vst/knob_mapping?rs_gear_type=${encodeURIComponent(rsGear)}&vst_name=${encodeURIComponent(vstStem)}`);
+                const data = await r.json();
+                const staticBlock = data && data.mapping && data.mapping._static;
+                if (staticBlock && typeof staticBlock === 'object') {
+                    await rbRestoreSavedParamsToSlot(api, slotId, staticBlock);
+                }
+            } catch (e) {
+                console.warn('[rig_builder catalog-edit] _static apply skipped:', e);
+            }
+        }
+        if (api.openPluginEditor) {
+            await api.openPluginEditor(slotId).catch((e) => {
+                console.warn('[rig_builder] openPluginEditor failed:', e);
+                alert(`Couldn't open editor for this plugin (the native window may have crashed). Plugin is loaded — try again or use the inline editor in a song's slot.`);
+            });
+        } else {
+            alert('This Slopsmith build has no openPluginEditor API.');
+        }
+    } catch (e) {
+        alert(`Edit failed: ${e.message || e}`);
+    }
+}
+
 async function rbAuditionVst(vstPath, vstFormat, btnId) {
     const api = rbNativeAudio();
     if (!api) return;
@@ -5673,29 +6967,48 @@ async function rbAuditionVst(vstPath, vstFormat, btnId) {
     // Toggle off if already auditioning this one.
     if (rbState._auditionId === btnId) {
         await rbStopPreview();
-        if (btn) { btn.disabled = false; btn.textContent = '▶'; }
-        return;
+        return;   // rbStopPreview restores btn.dataset.origLabel
     }
     if (rbState.listeningTone !== null || rbState._auditionId) {
         await rbStopPreview();
     }
+    // Stash the original button text so stop/swap can restore it.
+    if (btn && !btn.dataset.origLabel) btn.dataset.origLabel = btn.textContent;
     try {
         if (btn) { btn.disabled = true; btn.textContent = '…'; }
-        const url = `${RB_API}/native_preset_one?kind=vst&vst_path=${encodeURIComponent(vstPath)}&vst_format=${encodeURIComponent(vstFormat || 'VST3')}`;
-        const payload = await (await fetch(url)).json();
-        if (!payload || !payload.native_preset) throw new Error('no preset returned');
+        // Close any open VST editor window BEFORE touching the chain — an
+        // orphaned editor pointing at the slot we're about to wipe is the
+        // known crash trigger on consecutive ▶ Audition clicks.
+        await rbCloseActiveVstEditor();
         if (api.clearChain) await api.clearChain().catch(() => {});
-        const res = await api.loadPreset(JSON.stringify(payload.native_preset));
-        if (!res || res.success === false) throw new Error((res && res.error) || 'loadPreset failed');
+        // Use api.loadVST directly (same path as rbCatalogEditVst) instead of
+        // /native_preset_one + loadPreset. The loadPreset path was crashing
+        // on rapid sequential ▶ clicks between two VST pedals (the engine
+        // appears to mishandle the residual VST stage when the new chain is
+        // pushed before the old one fully unloads). loadVST is a one-shot
+        // single-stage path that doesn't have that race.
+        if (typeof api.loadVST !== 'function') {
+            throw new Error('engine has no loadVST API (WASM-only build?)');
+        }
+        const slotId = await api.loadVST(vstPath);
+        if (slotId == null || slotId < 0) throw new Error('engine refused this plugin');
         if (api.setMonitorMute) await api.setMonitorMute(false).catch(() => {});
         const wasRunning = api.isAudioRunning ? await api.isAudioRunning().catch(() => true) : true;
         await api.startAudio();
         rbState._previewStartedAudio = !wasRunning;
         rbState._previewMode = 'native';
         rbState._auditionId = btnId;
-        if (btn) { btn.disabled = false; btn.textContent = '⏸'; }
+        if (btn) {
+            btn.disabled = false;
+            const orig = btn.dataset.origLabel || '';
+            const labelTail = orig.replace(/^\s*▶\s*/, '');
+            btn.textContent = labelTail ? `⏸ ${labelTail}` : '⏸';
+        }
     } catch (e) {
-        if (btn) { btn.disabled = false; btn.textContent = '▶'; }
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = btn.dataset.origLabel || '▶';
+        }
         alert(`Audition failed: ${e.message || e}`);
     }
 }
@@ -5812,6 +7125,11 @@ async function rbLoadSettings() {
     if (megaCb) megaCb.checked = !!s.mega_chain_mode;
     const bac = document.getElementById('rb-bypass-all-cabs');
     if (bac) bac.checked = !!s.bypass_all_cabs;
+    // Inverted-sense checkbox: the user opts OUT of curated-only by
+    // ticking the box (= allow tone3000 fuzzy fallback). The persisted
+    // setting is still `curated_only`; the UI just shows the opposite.
+    const allowFuzzy = document.getElementById('rb-allow-tone3000-fallback');
+    if (allowFuzzy) allowFuzzy.checked = !s.curated_only;
     // Mirror the persisted flag onto the runtime mirror so RbMegaChain
     // sees it even if the user never opens Settings. rbLoadSettings is
     // called from rbInit so this runs at page-load.
@@ -5896,6 +7214,22 @@ async function rbSaveSettings() {
     });
     // Mirror to the runtime so RbMegaChain picks it up without a restart.
     window.__rbMegaChainSetting = mega_chain_mode;
+}
+
+// Opt-out toggle for the curated-only flow. The checkbox shows the
+// INVERSE of the persisted `curated_only` setting:
+//   - unchecked → curated_only = true  (default, recommended)
+//   - checked   → curated_only = false (allow tone3000 fuzzy fallback)
+// Persists immediately so the next Scan / song-open honours the
+// new value.
+async function rbSetAllowTone3000Fallback(checked) {
+    try {
+        await fetch(`${RB_API}/settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ curated_only: !checked }),
+        });
+    } catch (e) { /* best-effort */ }
 }
 
 // Open a native file picker (Electron desktop bridge) and drop the chosen
@@ -5985,15 +7319,17 @@ async function rbDownloadForGear(btn, rsGear, toneId) {
     }
 }
 
-// Combined "Extract everything" — runs the gear map first (the IR mapping
-// depends on it), then the IRs, against one gears.psarc. Aborts before the
-// IR step if the gear map fails (e.g. wrong archive), so a bad file can't
-// leave a half-set-up state.
+// Combined "Extract everything" — runs the 3 PSARC extractors back to
+// back against ONE gears.psarc: rebuild rs_to_real.json (gear map),
+// pull every amp/pedal/rack/cab PNG, then the cab IRs. Steps 2 and 3
+// are tolerant of soft failures (e.g. Pillow missing for photos) so a
+// partial setup isn't fatal — the user still gets a usable gear map +
+// IRs, and the catalog falls back to placeholders.
 async function rbExtractAll() {
     const path = document.getElementById('rb-all-psarc').value.trim();
     if (!path) return;
     const status = document.getElementById('rb-extract-all-status');
-    status.textContent = 'Step 1/2: rebuilding gear map…';
+    status.textContent = 'Step 1/3: rebuilding gear map…';
     try {
         let r = await fetch(`${RB_API}/extract_gear_map`, {
             method: 'POST',
@@ -6006,7 +7342,29 @@ async function rbExtractAll() {
             return;
         }
         const gearCount = data.count;
-        status.innerHTML = `<span class="text-gray-400">Gear map: ${gearCount} entries. Step 2/2: extracting cab IRs (30-60s)…</span>`;
+
+        // Step 2 — gear photos. Soft failure: a missing Pillow leaves
+        // the catalog using placeholders, which is still useful.
+        status.innerHTML = `<span class="text-gray-400">Gear map: ${gearCount} entries. Step 2/3: extracting gear photos (~10-20s)…</span>`;
+        let photosNote = '';
+        try {
+            r = await fetch(`${RB_API}/extract_gear_photos`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ gears_psarc: path }),
+            });
+            const photoData = await r.json();
+            if (!r.ok) {
+                photosNote = ` <span class="text-yellow-400">(photos skipped: ${rbEsc(photoData.error || r.status)})</span>`;
+            } else {
+                photosNote = ` <span class="text-gray-500">(photos: ${photoData.total} PNGs)</span>`;
+            }
+        } catch (e) {
+            photosNote = ` <span class="text-yellow-400">(photos skipped: ${rbEsc(e.message || e)})</span>`;
+        }
+
+        // Step 3 — cab IRs.
+        status.innerHTML = `<span class="text-gray-400">Gear map: ${gearCount}${photosNote}. Step 3/3: extracting cab IRs (30-60s)…</span>`;
         r = await fetch(`${RB_API}/extract_irs`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -6014,10 +7372,10 @@ async function rbExtractAll() {
         });
         data = await r.json();
         if (!r.ok) {
-            status.innerHTML = `<span class="text-yellow-400">Gear map OK (${gearCount}), but IR extraction failed: ${rbEsc(data.error || r.status)}</span>`;
+            status.innerHTML = `<span class="text-yellow-400">Gear map OK (${gearCount})${photosNote}, but IR extraction failed: ${rbEsc(data.error || r.status)}</span>`;
             return;
         }
-        status.innerHTML = `<span class="text-green-400">Done: ${gearCount} gear entries + ${data.count} cabs with IR. Reloading…</span>`;
+        status.innerHTML = `<span class="text-green-400">Done: ${gearCount} gear entries${photosNote} + ${data.count} cabs with IR. Reloading…</span>`;
         rbInit();
     } catch (e) {
         status.innerHTML = `<span class="text-red-400">${rbEsc(e.message)}</span>`;
@@ -6053,3 +7411,7 @@ async function rbExportDefaults() {
         status.innerHTML = `<span class="text-red-400">${rbEsc(e.message)}</span>`;
     }
 }
+
+// (rbRemapCabMics removed — _auto_fix_cab_mics_for_song now runs on
+// every /song fetch, so cab assignments self-heal at song-open time
+// without the user needing to visit Setup.)

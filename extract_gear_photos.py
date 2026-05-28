@@ -41,13 +41,15 @@ import sys
 from pathlib import Path
 
 
-# Which psarc subdir holds the art for each category. Pedals and racks
-# share the `effect/` folder; we disambiguate by manifest prefix.
-_PSARC_SUBDIR = {
-    "amp":   "amp",
-    "pedal": "effect",
-    "rack":  "effect",
-    "cab":   "cab",
+# Which psarc subdir(s) hold the art for each category. Some categories
+# split across multiple subdirs in Rocksmith's tree: guitar amps live in
+# `amp/` but bass amps live in `bass_amp/` (and similarly for cabs).
+# We try every listed subdir per entry and pick the first hit.
+_PSARC_SUBDIRS = {
+    "amp":   ("amp", "bass_amp"),
+    "pedal": ("effect", "bass_effect"),
+    "rack":  ("effect", "bass_effect"),
+    "cab":   ("cab", "bass_cab"),
 }
 
 # Filesystem subdir per category — what we name the output folder when
@@ -104,7 +106,7 @@ def extract_category(category: str, psarc_path: Path, rs_map: dict,
     """
     from PIL import Image
 
-    subdir = _PSARC_SUBDIR[category]
+    subdirs = _PSARC_SUBDIRS[category]
     targets: list[tuple[str, dict, str]] = []
     for k, v in rs_map.items():
         if not isinstance(v, dict):
@@ -121,7 +123,8 @@ def extract_category(category: str, psarc_path: Path, rs_map: dict,
 
     # Build candidate paths — variant fallback chain so a missing
     # `_<v>_hero` falls back to lower sizes / variant 0 rather than
-    # silently dropping the gear.
+    # silently dropping the gear. Subdir fallback handles bass amps
+    # (which live under `bass_amp/` rather than `amp/` in gears.psarc).
     size_fallbacks = [size]
     if size != "hero":
         size_fallbacks.append("hero")
@@ -132,22 +135,37 @@ def extract_category(category: str, psarc_path: Path, rs_map: dict,
     if variant != 0:
         variant_fallbacks.append(0)
 
+    # Cabs in Rocksmith are 1 base manifest × ~12 mic-position variants
+    # (`_5c`, `_5e`, `_co`, `_rc`, …). All variants of one cab share the
+    # SAME texture — the mic position is an audio-only thing. The art
+    # ships once under the base manifest, so for cabs we strip the
+    # suffix when building candidate paths. Example:
+    #   gear_bass_cab_at1150bc_5c → also try gear_bass_cab_at1150bc
+    mic_suffix_re = re.compile(r"_(?:[0-9]?[a-z]{1,2})$") if category == "cab" else None
+
     target_paths: list[tuple[str, dict, list[str]]] = []
     for k, v, manifest in targets:
+        manifests_to_try = [manifest]
+        if mic_suffix_re is not None:
+            base = mic_suffix_re.sub("", manifest)
+            if base and base != manifest and base not in manifests_to_try:
+                manifests_to_try.append(base)
         candidates = []
-        for var in variant_fallbacks:
-            for sz in size_fallbacks:
-                candidates.append(
-                    f"gfxassets/tone_designer/{subdir}/{manifest}_{var}_{sz}.dds")
+        for m in manifests_to_try:
+            for sd in subdirs:
+                for var in variant_fallbacks:
+                    for sz in size_fallbacks:
+                        candidates.append(
+                            f"gfxassets/tone_designer/{sd}/{m}_{var}_{sz}.dds")
         target_paths.append((k, v, candidates))
 
-    # One psarc read per category — the file is 400 MB, multiple
-    # reads add up.
-    print(f"[{category}] Reading gfxassets/tone_designer/{subdir}/*.dds from "
+    # One psarc read per category × subdir. The file is ~400 MB so we
+    # batch the globs into a single call when possible.
+    globs = [f"gfxassets/tone_designer/{sd}/*.dds" for sd in subdirs]
+    print(f"[{category}] Reading {', '.join(globs)} from "
           f"{psarc_path.name}…", file=sys.stderr)
-    entries = read_psarc_entries(
-        str(psarc_path), [f"gfxassets/tone_designer/{subdir}/*.dds"])
-    print(f"[{category}]   got {len(entries)} DDS entries in this subdir.",
+    entries = read_psarc_entries(str(psarc_path), globs)
+    print(f"[{category}]   got {len(entries)} DDS entries total.",
           file=sys.stderr)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -184,8 +202,10 @@ def main():
                     help="Output folder. Default: <category>_photos/ per "
                          "category (e.g. pedal_photos/). With --category all, "
                          "each category gets its own subfolder.")
-    ap.add_argument("--rs-map", default="rs_to_real.json",
-                    help="Path to rs_to_real.json (default: ./rs_to_real.json).")
+    ap.add_argument("--rs-map",
+                    default=str(Path(__file__).parent / "rs_to_real.json"),
+                    help="Path to rs_to_real.json (default: rs_to_real.json "
+                         "next to this script — works regardless of CWD).")
     ap.add_argument("--variant", type=int, default=0, choices=(0, 1, 2),
                     help="Art variant (0=primary, 1/2=alternate angles).")
     ap.add_argument("--size", default="hero",

@@ -32,6 +32,7 @@ pycryptodome import resolves):
 
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -143,6 +144,62 @@ def _bank_name_from_path(path: str) -> str:
     return leaf[:-4] if leaf.endswith(".bnk") else leaf
 
 
+def _wwise_fnv1_hash(name: str) -> int:
+    """Wwise's name-to-ID hash: FNV-1 32-bit over the **lowercased** name.
+
+    Wwise's authoring tool can ship a SoundBank in "short IDs only" mode
+    (no STID table). That's what Rocksmith does — so we never get the
+    effect names back from the .bnk itself. But the per-mic-position
+    JSON manifests under `manifests/gears/gear_*_<suffix>.json` carry
+    the original names; hashing each with this function yields the same
+    u32 the HIRC chunk stores as the Effect's object ID. That's how we
+    rejoin "5c" (the mic suffix) → "Bass_Cab_AT1150BC_57_Cone" (effect)
+    → media_id (DIDX entry) → which extracted .wav file.
+    """
+    h = 2166136261
+    for b in name.lower().encode("utf-8"):
+        h = (h * 16777619) & 0xFFFFFFFF
+        h ^= b
+    return h
+
+
+# Wwise HIRC object types we care about (most cab banks ship type-18
+# Effects — convolution reverb / FX node). The Effect payload starts
+# with 16 bytes of plugin metadata, 4 bytes plugin ID, then 38 bytes
+# of size/properties, and the referenced media ID lives at offset 58
+# from the payload start. The offset is stable across every cab bank
+# inspected.
+_HIRC_EFFECT_TYPE = 18
+_EFFECT_MEDIA_ID_OFFSET = 58
+
+
+def _parse_hirc_effect_to_media(hirc_payload: bytes,
+                                  media_ids: set[int]) -> dict[int, int]:
+    """Return {effect_object_id: media_id} for every type-18 Effect in
+    the HIRC chunk whose payload's media-id field references one of the
+    bank's known DIDX entries. Effects that reference unknown media IDs
+    (e.g. external streams) are skipped — those aren't cab IRs."""
+    out: dict[int, int] = {}
+    if len(hirc_payload) < 4:
+        return out
+    n_obj = struct.unpack_from("<I", hirc_payload, 0)[0]
+    p = 4
+    for _ in range(n_obj):
+        if p + 9 > len(hirc_payload):
+            break
+        otype = hirc_payload[p]
+        osize = struct.unpack_from("<I", hirc_payload, p + 1)[0]
+        oid = struct.unpack_from("<I", hirc_payload, p + 5)[0]
+        if otype == _HIRC_EFFECT_TYPE and osize >= _EFFECT_MEDIA_ID_OFFSET + 4:
+            # payload of the object starts at p+9 (after type, size, id).
+            mid = struct.unpack_from(
+                "<I", hirc_payload, p + 9 + _EFFECT_MEDIA_ID_OFFSET)[0]
+            if mid in media_ids:
+                out[oid] = mid
+        p += 5 + osize
+    return out
+
+
 def extract_all(gears_psarc: str, irs_root: Path) -> dict:
     """Pull every cab IR out of gears_psarc. Returns the extraction
     summary (counts + a sound_bank → [files] map) and writes the .wav
@@ -154,6 +211,12 @@ def extract_all(gears_psarc: str, irs_root: Path) -> dict:
     files = read_psarc_entries(gears_psarc, _BANK_PATTERNS)
 
     bank_to_irs: dict[str, list[str]] = {}
+    # Per-bank info needed to map mic-position → IR file: which media_id
+    # ended up at which 00/01/02/… .wav, and the HIRC effect_id → media_id
+    # table. Both populated below; consumed by extract_cab_mic_map() to
+    # build rs_cab_mic_map.json without re-parsing the banks.
+    bank_to_media_idx: dict[str, dict[int, int]] = {}
+    bank_to_effect_media: dict[str, dict[int, int]] = {}
     total_irs = 0
     banks_with_audio = 0
     banks_without_audio = 0
@@ -167,7 +230,8 @@ def extract_all(gears_psarc: str, irs_root: Path) -> dict:
         bank_name = _bank_name_from_path(bank_path)
         data = chunks["DATA"]
         ir_files: list[str] = []
-        for idx, (_, offset, size) in enumerate(_parse_didx(chunks["DIDX"])):
+        media_to_idx: dict[int, int] = {}
+        for idx, (media_id, offset, size) in enumerate(_parse_didx(chunks["DIDX"])):
             if size < 16:
                 continue
             wem = data[offset:offset + size]
@@ -188,9 +252,19 @@ def extract_all(gears_psarc: str, irs_root: Path) -> dict:
             samples = _peak_normalize_float32(samples)
             _write_float32_wav(out_dir / out_name, samples, sample_rate, channels)
             ir_files.append(f"rocksmith/{out_name}")
+            media_to_idx[media_id] = idx
             total_irs += 1
         if ir_files:
             bank_to_irs[bank_name] = ir_files
+            bank_to_media_idx[bank_name] = media_to_idx
+            # HIRC: only present in banks that ship FX graphs (cabs do; amps
+            # don't). For amp banks this stays an empty dict and the mic-map
+            # builder just skips them.
+            if "HIRC" in chunks:
+                bank_to_effect_media[bank_name] = _parse_hirc_effect_to_media(
+                    chunks["HIRC"], set(media_to_idx.keys()))
+            else:
+                bank_to_effect_media[bank_name] = {}
 
     return {
         "irs_root": str(out_dir),
@@ -198,6 +272,8 @@ def extract_all(gears_psarc: str, irs_root: Path) -> dict:
         "banks_with_audio": banks_with_audio,
         "banks_without_audio": banks_without_audio,
         "bank_to_irs": bank_to_irs,
+        "bank_to_media_idx": bank_to_media_idx,
+        "bank_to_effect_media": bank_to_effect_media,
     }
 
 
@@ -221,6 +297,152 @@ def build_rs_cab_to_ir(bank_to_irs: dict[str, list[str]], rs_to_real_path: Path)
     return rs_cab_to_ir
 
 
+def _decode_mic_suffix(suffix: str, category_field: str = "") -> tuple[str, str, str]:
+    """Decode a cab-variant suffix into (mic_type, position, friendly_label).
+
+    Rocksmith encodes cab mic variants as a 2-char suffix on the rs_gear
+    name (e.g. `Bass_Cab_AT1150BC_5c`). The first char is the mic type:
+
+        5 → SM57 (dynamic)
+        c → Condenser
+        r → Ribbon
+        t → Tube
+
+    Second char is the position:
+
+        c → close (on-axis cone)
+        e → edge (off-cone)
+        o → off-axis
+
+    When the JSON manifest already shipped a `Category` field
+    (`Dynamic_Cone`, `Condenser_Edge`, …), we trust it over the suffix
+    decode — pure belt-and-braces.
+    """
+    mic_map = {"5": "Dynamic (SM57)", "c": "Condenser",
+               "r": "Ribbon", "t": "Tube"}
+    pos_map = {"c": "Cone (close)", "e": "Edge", "o": "Off-axis"}
+    mic = mic_map.get(suffix[:1].lower(), suffix[:1])
+    pos = pos_map.get(suffix[1:2].lower(), suffix[1:])
+    # JSON Category like "Dynamic_Cone" — promote it for the friendly label.
+    if category_field:
+        friendly = category_field.replace("_", " ")
+    else:
+        friendly = f"{mic} {pos}"
+    return mic, pos, friendly
+
+
+def build_rs_cab_mic_map(gears_psarc: str,
+                          bank_to_media_idx: dict[str, dict[int, int]],
+                          bank_to_effect_media: dict[str, dict[int, int]],
+                          bank_to_irs: dict[str, list[str]]) -> dict:
+    """Resolve which IR .wav corresponds to which mic position per cab.
+
+    For every cab gear manifest (`manifests/gears/gear_*_<suffix>.json`)
+    we read the Effect name (e.g. `Bass_Cab_AT1150BC_57_Cone`), hash it
+    with Wwise's FNV-1 to get the effect's object ID, look up the
+    media_id that Effect references in the bank's HIRC, then map that
+    media_id to the IR-file index via DIDX order. Output:
+
+        {
+          "Bass_Cab_AT1150BC": {
+            "5c": {
+              "ir_index": 3,
+              "ir_file": "rocksmith/bass_cab_at1150bc_03.wav",
+              "mic_type": "Dynamic (SM57)",
+              "position": "Cone (close)",
+              "label": "Dynamic Cone",
+              "effect_name": "Bass_Cab_AT1150BC_57_Cone"
+            },
+            "5e": { … },
+            ...
+          },
+          ...
+        }
+
+    Cabs whose .bnk doesn't ship HIRC (none, in the base game) or whose
+    manifest references unknown effect names simply get an empty dict —
+    the UI keeps the legacy numbered dropdown for those.
+    """
+    out: dict[str, dict] = {}
+    manifests = read_psarc_entries(gears_psarc, ["manifests/gears/gear_*cab*.json"])
+    # Group manifests by base manifest name (strip the _<suffix>).
+    suffix_re = re.compile(r"_(?:[0-9]?[a-z]{1,2})$")
+    for path, blob in manifests.items():
+        # path: manifests/gears/gear_bass_cab_at1150bc_5c.json
+        leaf = path.rsplit("/", 1)[-1]
+        if not leaf.endswith(".json"):
+            continue
+        stem = leaf[:-5]           # gear_bass_cab_at1150bc_5c
+        m = suffix_re.search(stem)
+        if not m:
+            continue
+        suffix = stem[m.start() + 1:]
+        base_manifest = stem[:m.start()]   # gear_bass_cab_at1150bc
+        # Parse manifest
+        try:
+            mani = json.loads(blob)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        entries = (mani.get("Entries") or {})
+        if not entries:
+            continue
+        attrs = next(iter(entries.values())).get("Attributes", {})
+        sb = (attrs.get("SoundBank") or "").lower()
+        if sb.endswith(".bnk"):
+            sb = sb[:-4]
+        effects = attrs.get("Effects") or []
+        if not effects:
+            continue
+        effect_name = effects[0].get("Name", "")
+        if not effect_name:
+            continue
+        # Look up the IR file.
+        media_to_idx = bank_to_media_idx.get(sb, {})
+        eff_to_media = bank_to_effect_media.get(sb, {})
+        ir_files = bank_to_irs.get(sb, [])
+        eid = _wwise_fnv1_hash(effect_name)
+        media_id = eff_to_media.get(eid)
+        if media_id is None:
+            continue
+        idx = media_to_idx.get(media_id)
+        if idx is None or idx >= len(ir_files):
+            continue
+        # rs_gear base form: convert `gear_bass_cab_at1150bc` →
+        # `Bass_Cab_AT1150BC` to match what the catalog renders.
+        # The manifest's Attributes.ManifestUrn is `urn:database:json-db:
+        # gear_bass_cab_at1150bc_5c` — but for the parent rs_gear we use
+        # the in-app `Name` field's lowercase-with-underscores form. Fall
+        # back to title-case of the underscored stem otherwise.
+        base_rs_gear = _manifest_to_rs_gear(base_manifest)
+        mic_type, position, label = _decode_mic_suffix(
+            suffix, attrs.get("Category", ""))
+        out.setdefault(base_rs_gear, {})[suffix] = {
+            "ir_index": idx,
+            "ir_file": ir_files[idx],
+            "mic_type": mic_type,
+            "position": position,
+            "label": label,
+            "effect_name": effect_name,
+        }
+    return out
+
+
+def _manifest_to_rs_gear(manifest: str) -> str:
+    """Convert a manifest stem like `gear_bass_cab_at1150bc` to the
+    `Bass_Cab_AT1150BC` rs_gear-base form. We strip the `gear_` prefix,
+    title-case each underscore-separated token EXCEPT the last segment,
+    which is uppercased en bloc (Rocksmith codenames like `AT1150BC` are
+    all-caps in rs_to_real.json — see Bass_Cab_AT1150BC vs the manifest
+    `gear_bass_cab_at1150bc`)."""
+    if manifest.startswith("gear_"):
+        manifest = manifest[5:]
+    tokens = manifest.split("_")
+    if not tokens:
+        return ""
+    parts = [t.capitalize() for t in tokens[:-1]] + [tokens[-1].upper()]
+    return "_".join(parts)
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__, file=sys.stderr)
@@ -238,10 +460,26 @@ def main():
     out_json = Path(__file__).parent / "rs_cab_to_ir.json"
     out_json.write_text(json.dumps(rs_cab_to_ir, indent=2, sort_keys=True))
 
+    # Cab mic-position map — maps each cab's mic-position suffix (`5c`,
+    # `cc`, `te`, etc.) to the actual extracted IR file via HIRC ↔ DIDX
+    # cross-reference. Optional but high-value: the catalog uses it to
+    # show "Dynamic close / Condenser edge / Tube off-axis" instead of
+    # generic "IR 00 / IR 01 / IR 02".
+    mic_map = build_rs_cab_mic_map(
+        gears_psarc,
+        summary["bank_to_media_idx"],
+        summary["bank_to_effect_media"],
+        summary["bank_to_irs"],
+    )
+    mic_json = Path(__file__).parent / "rs_cab_mic_map.json"
+    mic_json.write_text(json.dumps(mic_map, indent=2, sort_keys=True))
+
     print(f"Extracted {summary['total_irs']} IRs into {summary['irs_root']}")
     print(f"Banks with audio: {summary['banks_with_audio']}")
     print(f"Banks without audio (skipped): {summary['banks_without_audio']}")
     print(f"Wrote rs_cab_to_ir.json with {len(rs_cab_to_ir)} RS entities mapped to extracted IRs")
+    total_mics = sum(len(v) for v in mic_map.values())
+    print(f"Wrote rs_cab_mic_map.json: {len(mic_map)} cabs × {total_mics} mic positions resolved")
 
 
 if __name__ == "__main__":
