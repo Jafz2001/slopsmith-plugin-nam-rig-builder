@@ -4158,6 +4158,12 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
         rs_irs_map = _load_rs_cab_to_ir()
         irs_root = _config_dir / "nam_irs"
         client = _get_t3k_client()
+        # Installed-VST lookup so pedals/racks/EQ get their curated VST
+        # primary (rs_gear_to_vst.json) instead of a tone3000 NAM — same as
+        # the batch worker. This is what was missing on the per-song / cloud
+        # materialization path, so cloud-downloaded songs landed on NAMs and
+        # needed a manual "remap all".
+        known_vst_lookup = _build_known_vst_lookup()
 
         if path.suffix.lower() == ".sloppak":
             raw_tones = _read_tones_from_sloppak(filename, _get_dlc_dir())
@@ -4263,6 +4269,32 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                     counts["skipped_assigned"] += 1
                     counts["processed"] += 1
                     continue
+
+                # Promote to the installed primary VST (rs_gear_to_vst.json)
+                # before any tone3000 NAM search — mirrors the batch worker so
+                # cloud-materialized / per-song downloads assign pedal/rack/EQ
+                # VSTs (with the RS-knob → param vst_state) instead of a NAM.
+                # Skip amps (NAM-capture pipeline) + cabs (IRs).
+                if category not in ("amp", "cab"):
+                    _vst_pick = _pick_installed_primary_vst(rs_type, known_vst_lookup)
+                    if _vst_pick:
+                        _vst_state = _compute_vst_state_for_piece(
+                            rs_type, _vst_pick["vst_path"], piece["knobs"]
+                        )
+                        pieces.append({
+                            "slot": piece["slot"],
+                            "rs_gear_type": rs_type,
+                            "kind": "vst",
+                            "file": None,
+                            "params": piece["knobs"],
+                            "tone3000_id": None,
+                            "assigned_mode": "auto",
+                            "vst_path": _vst_pick["vst_path"],
+                            "vst_format": _vst_pick["vst_format"],
+                            "vst_state": _vst_state,
+                        })
+                        counts["processed"] += 1
+                        continue
 
                 # Cab fast-path: prefer the Rocksmith IR when on disk.
                 # Use the song's `Cabinet.Key` (the Wwise Effect name —
