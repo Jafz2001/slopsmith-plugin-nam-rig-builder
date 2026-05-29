@@ -908,6 +908,122 @@ def _load_vst_seed_catalog() -> dict:
     return _vst_seed_catalog
 
 
+def _build_known_vst_lookup() -> dict:
+    """Read rig_builder_known_vsts.json (populated by the frontend after the
+    user clicks Settings → Scan for plugins) and return a lookup keyed by
+    lowercased plugin name. Each value is a list of installed entries
+    (one per format) sorted VST3-first so VST3 wins over AU on ties.
+
+    Used by the batch worker to promote each gear to its primary VST when
+    installed. Returns empty dict if the cache file is missing or
+    unreadable — caller falls back to the NAM/IR resolution path.
+    """
+    out: dict[str, list[dict]] = {}
+    if _config_dir is None:
+        return out
+    path = _config_dir / "rig_builder_known_vsts.json"
+    if not path.exists():
+        return out
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        log.warning("known_vsts file unreadable", exc_info=True)
+        return out
+    plugins = (
+        data.get("plugins") if isinstance(data, dict)
+        else (data if isinstance(data, list) else [])
+    )
+    if not isinstance(plugins, list):
+        return out
+    for p in plugins:
+        if not isinstance(p, dict) or not p.get("name") or not p.get("path"):
+            continue
+        out.setdefault(p["name"].lower(), []).append(p)
+    for entries in out.values():
+        entries.sort(key=lambda e: 0 if (e.get("format") or "").upper() == "VST3" else 1)
+    return out
+
+
+def _pick_installed_primary_vst(rs_gear: str, known_lookup: dict) -> dict | None:
+    """Return {vst_path, vst_format} for the first installed primary VST
+    for this gear, or None if none of the gear's recommended VSTs are
+    installed.
+
+    Reads `rs_gear_to_vst.json` order — first entry per gear IS the
+    primary (user-curated). Walks the candidates; the first one whose
+    `name` matches an installed plugin wins. When the candidate declares
+    a preferred format (VST3/AU), match it exactly; otherwise pick the
+    first installed entry (VST3-first ordering from
+    _build_known_vst_lookup).
+    """
+    if not rs_gear or not known_lookup:
+        return None
+    seed = _load_vst_seed_catalog() or {}
+    candidates = seed.get(rs_gear)
+    if not isinstance(candidates, list):
+        return None
+    for cand in candidates:
+        if not isinstance(cand, dict) or not cand.get("name"):
+            continue
+        installed = known_lookup.get(cand["name"].lower())
+        if not installed:
+            continue
+        wanted_fmt = (cand.get("format") or "").upper()
+        if wanted_fmt:
+            for entry in installed:
+                if (entry.get("format") or "").upper() == wanted_fmt:
+                    return {"vst_path": entry["path"],
+                            "vst_format": entry["format"]}
+        return {"vst_path": installed[0]["path"],
+                "vst_format": installed[0].get("format") or "VST3"}
+    return None
+
+
+def _compute_vst_state_for_piece(rs_gear: str, vst_path: str,
+                                  params_dict: dict | None) -> str | None:
+    """Compute the JSON `{"params": {...}}` envelope to stamp into
+    preset_piece.vst_state for a freshly-auto-assigned VST primary.
+
+    Mirrors apply_vst_state.py's _build_params_for_piece logic — same
+    `_VST_PARAM_RANGES`, same `_static` block + per-knob translation —
+    so the batch worker produces the same state the standalone bulk
+    script would. Without this, fresh-installed pedals would load
+    their VST primaries at plugin defaults regardless of RS knob
+    settings, defeating the point of the auto-mapping.
+
+    Returns the JSON string, or `None` when no mapping exists for this
+    (gear, vst) pair (caller leaves vst_state NULL and the plugin
+    opens at defaults — same as a 📸 Capture that hasn't been saved).
+    """
+    if not rs_gear or not vst_path:
+        return None
+    try:
+        import apply_vst_state as _avs
+    except ImportError:
+        return None
+    knob_path = _plugin_dir / "rs_knob_to_vst_param.json"
+    if not knob_path.exists():
+        return None
+    try:
+        full = json.loads(knob_path.read_text())
+    except (ValueError, OSError):
+        return None
+    knob_table = {k: v for k, v in full.items() if not k.startswith("_")}
+    try:
+        result = _avs._build_params_for_piece(
+            rs_gear, vst_path,
+            json.dumps(params_dict or {}), knob_table,
+        )
+    except Exception:
+        log.warning("vst_state compute failed for %s / %s",
+                    rs_gear, vst_path, exc_info=True)
+        return None
+    if result is None:
+        return json.dumps({"params": {}})
+    params_by_name, _skipped = result
+    return json.dumps({"params": params_by_name})
+
+
 class _CaseInsensitiveDict(dict):
     """A dict whose `.get(key)` falls back to a case-insensitive lookup
     when the exact key isn't present. Used for the rs_cab_to_ir and
@@ -2741,7 +2857,7 @@ def _rename_legacy_filenames_to_readable() -> dict:
     }
 
 
-def _wire_cabs_to_presets() -> dict:
+def _wire_cabs_to_presets(replace_auto: bool = False) -> dict:
     """Link Rocksmith-extracted IRs to cab preset_pieces rows.
 
     Companion to `_wire_curated_variants_to_presets` but for cabs.
@@ -2755,9 +2871,15 @@ def _wire_cabs_to_presets() -> dict:
          mic-position suffix like `_5c`, `_5e`, while the DB stores
          the bare gear name).
       2. Pick the first IR file that actually exists on disk.
-      3. Bulk UPDATE every cab row of that gear whose file is still
-         NULL, setting kind='rs_ir' and the IR path. Skips rows that
-         a user manually overrode.
+      3. Bulk UPDATE every cab row of that gear, setting kind='rs_ir'
+         and the IR path. Manual rows always preserved.
+
+    `replace_auto` (default False): when False, only fills cab rows
+    that are currently empty (file IS NULL). When True, ALSO replaces
+    auto-assigned tone3000 IRs/NAMs — useful right after the user
+    runs Extract from gears.psarc, where the intent is clearly "use
+    the newly-extracted Rocksmith IRs now". Manual overrides are
+    untouched in both modes.
 
     Cabs not present in the extracted-IR map (Eden, some Orange
     bass cabs) are left as Pending — they need a tone3000 search
@@ -2768,15 +2890,23 @@ def _wire_cabs_to_presets() -> dict:
     conn = _get_conn()
     rs_cab_map = _load_rs_cab_to_ir() or {}
     irs_root = _config_dir / "nam_irs"
-    summary = {"wired": 0, "skipped_no_ir": [], "errors": []}
+    summary = {"wired": 0, "skipped_no_ir": [], "errors": [], "replace_auto": replace_auto}
 
-    # Distinct cab gears that have NULL-file rows we could fill.
-    cab_gears = [
-        r[0] for r in conn.execute(
+    # Distinct cab gears we could wire. In default mode only those with
+    # at least one empty row; in replace_auto mode all cabs (any row that
+    # isn't a manual override is fair game).
+    if replace_auto:
+        cab_gears_q = (
+            "SELECT DISTINCT rs_gear_type FROM preset_pieces "
+            "WHERE slot = 'cabinet' "
+            "  AND (assigned_mode IS NULL OR assigned_mode NOT IN ('manual','manual_vst'))"
+        )
+    else:
+        cab_gears_q = (
             "SELECT DISTINCT rs_gear_type FROM preset_pieces "
             "WHERE slot = 'cabinet' AND (file IS NULL OR file = '')"
-        ).fetchall()
-    ]
+        )
+    cab_gears = [r[0] for r in conn.execute(cab_gears_q).fetchall()]
 
     # Build a case-insensitive lookup index over rs_cab_to_ir.json.
     # The JSON keys use mixed case (`Cab_Marshall1960a`, `Cab_OrangePPC212OB`)
@@ -2811,17 +2941,32 @@ def _wire_cabs_to_presets() -> dict:
             summary["skipped_no_ir"].append(gear)
             continue
         try:
-            cur = conn.execute(
-                """
-                UPDATE preset_pieces
-                SET file = ?, kind = 'rs_ir', assigned_mode = 'auto'
-                WHERE slot = 'cabinet'
-                  AND rs_gear_type = ?
-                  AND (file IS NULL OR file = '')
-                  AND (assigned_mode IS NULL OR assigned_mode NOT IN ('manual', 'manual_vst'))
-                """,
-                (chosen, gear),
-            )
+            if replace_auto:
+                # Re-point every auto cab row at the freshly-extracted
+                # IR — including rows that already had a tone3000 IR
+                # or auto NAM assigned.
+                cur = conn.execute(
+                    """
+                    UPDATE preset_pieces
+                    SET file = ?, kind = 'rs_ir', assigned_mode = 'auto'
+                    WHERE slot = 'cabinet'
+                      AND rs_gear_type = ?
+                      AND (assigned_mode IS NULL OR assigned_mode NOT IN ('manual', 'manual_vst'))
+                    """,
+                    (chosen, gear),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE preset_pieces
+                    SET file = ?, kind = 'rs_ir', assigned_mode = 'auto'
+                    WHERE slot = 'cabinet'
+                      AND rs_gear_type = ?
+                      AND (file IS NULL OR file = '')
+                      AND (assigned_mode IS NULL OR assigned_mode NOT IN ('manual', 'manual_vst'))
+                    """,
+                    (chosen, gear),
+                )
             summary["wired"] += cur.rowcount
         except Exception as e:
             summary["errors"].append(f"{gear}: {e}")
@@ -3180,6 +3325,19 @@ def _batch_worker(mode: str = "all"):
         client = _get_t3k_client()
         settings = _load_settings()
         rs_irs_map = _load_rs_cab_to_ir()
+        # Read the installed-VSTs cache ONCE per batch run. Drives the new
+        # "promote to primary VST" step below so a fresh install lights up
+        # every pedal/comp/EQ/mod with its bundled free VST primary instead
+        # of falling through to a tone3000 NAM search. Empty when the user
+        # hasn't run Settings → Scan for plugins yet (degrades cleanly to
+        # the prior NAM-only resolution).
+        known_vst_lookup = _build_known_vst_lookup()
+        if known_vst_lookup:
+            _batch_log(f"Known VSTs: {sum(len(v) for v in known_vst_lookup.values())} entries "
+                       f"across {len(known_vst_lookup)} plugin names")
+        else:
+            _batch_log("No installed VSTs cached — gears with a VST primary will fall back to NAM "
+                       "(run Settings → Scan for plugins first to enable VST auto-assign)")
         seen_gears: dict[str, dict] = {}  # rs_gear_type → top tone3000 candidate or {}
 
         for idx, song_path in enumerate(songs):
@@ -3275,6 +3433,41 @@ def _batch_worker(mode: str = "all"):
                             "vst_state": _prev_piece.get("vst_state"),
                         })
                         continue
+
+                    # 0.5. Promote to primary VST when one is installed.
+                    # rs_gear_to_vst.json holds a curator-ranked list of
+                    # VST/AU recommendations per gear (first = primary).
+                    # If the user has installed the primary's plugin
+                    # (Kilohearts Essentials, Melda MFreeFXBundle, etc.)
+                    # and ran Settings → Scan for plugins to populate
+                    # the known_vsts cache, we assign it here instead of
+                    # falling through to a tone3000 NAM search. We also
+                    # compute the same `vst_state` envelope that
+                    # apply_vst_state.py would generate from the RS knobs
+                    # — without that step the plugin would load at
+                    # defaults regardless of how the song's tone is
+                    # actually configured. Skip for amps + cabs (amps
+                    # use the NAM-capture pipeline; cabs use IRs).
+                    if category not in ("amp", "cab"):
+                        _vst_pick = _pick_installed_primary_vst(rs_type, known_vst_lookup)
+                        if _vst_pick:
+                            _vst_state = _compute_vst_state_for_piece(
+                                rs_type, _vst_pick["vst_path"], piece["knobs"]
+                            )
+                            pieces.append({
+                                "slot": piece["slot"],
+                                "rs_gear_type": rs_type,
+                                "kind": "vst",
+                                "file": None,
+                                "params": piece["knobs"],
+                                "tone3000_id": None,
+                                "assigned_mode": "auto",
+                                "bypassed": existing_by_gear.get(rs_type, {}).get("bypassed", False),
+                                "vst_path": _vst_pick["vst_path"],
+                                "vst_format": _vst_pick["vst_format"],
+                                "vst_state": _vst_state,
+                            })
+                            continue
 
                     # Cabs first: if we extracted a Rocksmith IR for
                     # this gear AND it's actually on disk, assign it.
@@ -4131,7 +4324,24 @@ def setup(app, context):
                 500,
             )
         _invalidate_rs_cab_to_ir()
-        return {"ok": True, "stdout": result.stdout, "count": len(_load_rs_cab_to_ir())}
+        # Tail step: wire the freshly-extracted IRs into every cab piece in
+        # the DB. Without this, extract alone wrote files to disk but no
+        # preset_piece pointed at them — the user had to remember to Rescan
+        # all afterwards to make the cabs use the new Rocksmith IRs.
+        # `replace_auto=True` so existing auto-assigned tone3000 IRs/NAMs
+        # get re-pointed at the now-on-disk Rocksmith IR; manual overrides
+        # are still preserved.
+        wire_result = {"wired": 0, "errors": []}
+        try:
+            wire_result = _wire_cabs_to_presets(replace_auto=True)
+        except Exception:
+            log.exception("post-extract cab wire failed")
+        return {
+            "ok": True, "stdout": result.stdout,
+            "count": len(_load_rs_cab_to_ir()),
+            "cabs_wired": wire_result.get("wired", 0),
+            "cabs_skipped": wire_result.get("skipped_no_ir") or [],
+        }
 
     @app.post("/api/plugins/rig_builder/normalize_rocksmith_irs")
     def normalize_rocksmith_irs():

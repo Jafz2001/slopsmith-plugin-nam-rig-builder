@@ -1,3 +1,42 @@
+# Rig Builder 1.3.1 — VST primary auto-assign + cab IRs wire on extract (2026-05-28)
+
+Two fresh-install fixes flagged by users who ran the documented 1.3.0
+workflow (Settings → Scan for plugins → Setup → Rescan all) but ended
+up with no VSTs mapped to their pedals and no cabinets assigned after
+extracting from gears.psarc:
+
+- **Rescan all now promotes each gear to its primary installed VST.**
+  Previously the batch worker only resolved NAM/IR captures from
+  tone3000 + curated defaults — it never consulted `rs_gear_to_vst.json`,
+  so even with Kilohearts Essentials + Melda MFreeFXBundle installed
+  and scanned, every pedal/comp/EQ/mod stayed as a NAM. New step,
+  inserted between "manual is sacred" and the cab branch: for each
+  non-amp/non-cab gear, walk the gear's primary VST candidates from
+  `rs_gear_to_vst.json`, pick the first one that's in the
+  `rig_builder_known_vsts.json` cache, and assign it. Also computes
+  the matching `vst_state` envelope from the song's RS knobs (using
+  the same `apply_vst_state.py` logic as the standalone script), so
+  the VST loads with the right params at song-play time instead of at
+  plugin defaults.
+
+- **Extract from gears.psarc now wires the IRs into cabs automatically.**
+  Extracting wrote `.wav` files under `nam_irs/rocksmith/` but didn't
+  update any `preset_pieces.file` column, so the user had to remember
+  to Rescan all afterwards before any cab actually used the new IRs.
+  The endpoint now calls `_wire_cabs_to_presets(replace_auto=True)`
+  as a tail step: every cab row that wasn't manually overridden gets
+  re-pointed at the freshly-extracted Rocksmith IR, even if it already
+  had a tone3000 IR assigned. Manual overrides stay sacred. Response
+  payload reports `cabs_wired` so the UI can show "extracted N IRs,
+  wired M cab rows".
+
+If your 1.3.0 workflow looked clean but pedals/cabs weren't actually
+using the right plugins/IRs, just upgrade and run **Settings → Scan
+for plugins** + **Setup → Rescan all** once. Existing manual picks
+(including 📸-captured states) are preserved across the migration.
+
+---
+
 # Rig Builder 1.3.0 — full VST chain for pedals/comp/EQ, bass-aware audio, cab self-heal (2026-05-28)
 
 A **pedals + modulation + EQ + comp overhaul**: every distortion / fuzz /
