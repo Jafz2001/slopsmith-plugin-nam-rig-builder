@@ -58,8 +58,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from common import PLUGIN_ROOT, DATA_DIR, default_db_path
 
-_PLUGIN_DIR = Path(__file__).parent
+
+_PLUGIN_DIR = PLUGIN_ROOT
+_default_db_path = default_db_path
 
 
 # VST param display-value ranges, used to convert curated dB/Hz/etc values to
@@ -121,11 +124,14 @@ _VST_PARAM_RANGES: dict[str, dict[str, tuple[str, float, float]]] = {
     # 0..100% sliders already, so most curated mappings (scale=0.01) land in
     # [0,1] without help. Only the dB/Hz params need ranges here.
     "khs compressor": {
-        # Same convention as mcompressor: Threshold + Makeup are dB so range
-        # them; Attack / Release / Ratio rely on the curator's normalized
-        # mapping (scale=0.01) so no range here (range would double-normalize).
+        # Threshold + Makeup are dB so range them. Ratio gets a log range
+        # (mirrors mcompressor) so a literal RS ratio (1..4) normalizes
+        # correctly — without it, scale=1.0 passed the raw ratio straight
+        # through as a 0-1 value, so RS Ratio 1 → 1.0 → "Inf:1". Attack /
+        # Release still rely on the curator's normalized scale (no range).
         "Threshold":   ("linear", -60.0, 0.0),
         "Makeup gain": ("linear", -24.0, 24.0),
+        "Ratio":       ("log",     1.0, 100.0),
     },
     "khs 3-band eq": {
         "Low Gain":    ("linear", -24.0, 24.0),
@@ -156,19 +162,6 @@ def _normalize_display(value: float, kind: str, lo: float, hi: float) -> float:
     if hi == lo:
         return 0.0
     return (value - lo) / (hi - lo)
-
-
-def _default_db_path() -> Path | None:
-    system = platform.system()
-    if system == "Darwin":
-        return Path.home() / "Library/Application Support/slopsmith-desktop/slopsmith-config/nam_tone.db"
-    if system == "Windows":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            return Path(appdata) / "slopsmith-desktop/slopsmith-config/nam_tone.db"
-        return None
-    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(xdg) / "slopsmith-desktop/slopsmith-config/nam_tone.db"
 
 
 def _vst_stem(vst_path: str) -> str:
@@ -296,9 +289,9 @@ def main() -> int:
         print(f"nam_tone.db not found at {db_path}.", file=sys.stderr)
         return 1
 
-    knob_table = json.loads((_PLUGIN_DIR / "rs_knob_to_vst_param.json").read_text())
+    knob_table = json.loads((DATA_DIR / "rs_knob_to_vst_param.json").read_text())
     knob_table = {k: v for k, v in knob_table.items() if not k.startswith("_")}
-    rs_map = json.loads((_PLUGIN_DIR / "rs_to_real.json").read_text())
+    rs_map = json.loads((DATA_DIR / "rs_to_real.json").read_text())
 
     # Filter to gears matching --category (or --rs-gear)
     if args.rs_gear:

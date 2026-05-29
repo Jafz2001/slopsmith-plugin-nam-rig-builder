@@ -442,6 +442,19 @@ let rbState = {
     _vstEditorSlot: null,   // engine slotId currently being edited (for Capture State)
 };
 
+// ── Effective-assignment readers ────────────────────────────────────
+// A chain piece carries two layers: the persisted `assigned` (from the DB)
+// and optional in-memory edits (`_uploaded_file`, `_vst_path`, …) staged in
+// the editor before save. "Effective" = the staged edit if present, else the
+// persisted value. These five helpers replace the same nullish-coalescing
+// expression that was copy-pasted ~20× across the song editor, master chain
+// and catalog — one place to read "what does this piece actually play?".
+function rbEffFile(p)     { return p._uploaded_file || (p.assigned && p.assigned.file) || null; }
+function rbEffKind(p)     { return p._uploaded_kind || (p.assigned && p.assigned.kind) || null; }
+function rbEffVstPath(p)  { return p._vst_path || (p.assigned && p.assigned.vst_path) || ''; }
+function rbEffVstFormat(p){ return p._vst_format || (p.assigned && p.assigned.vst_format) || 'VST3'; }
+function rbEffVstState(p) { return p._vst_state ?? (p.assigned && p.assigned.vst_state) ?? null; }
+
 const RB_API = '/api/plugins/rig_builder';
 
 // Cache-bust query for gear-photo URLs. Set once per session so:
@@ -1530,6 +1543,7 @@ async function rbPurgeNams(filter, label) {
 
 async function rbLoadCoverage() {
     const el = document.getElementById('rb-gear-coverage');
+    if (!el) return;   // coverage card removed from Settings
     const s = rbState.status;
     if (!s || !s.rs_to_real_loaded) {
         el.innerHTML = '<span class="text-yellow-500">rs_to_real.json no cargado.</span>';
@@ -2261,9 +2275,9 @@ function rbRenderPieceEditor(p, toneIdx, pIdx, filename) {
     const pendingKind = p._uploaded_kind || p._vst_kind;
     const assignedKind = p.assigned && p.assigned.kind;
     const effKind = pendingKind || assignedKind || (isCab ? 'ir' : 'nam');
-    const effVstPath = p._vst_path || (p.assigned && p.assigned.vst_path) || '';
-    const effVstFormat = p._vst_format || (p.assigned && p.assigned.vst_format) || 'VST3';
-    const effFile = p._uploaded_file || (p.assigned && p.assigned.file) || null;
+    const effVstPath = rbEffVstPath(p);
+    const effVstFormat = rbEffVstFormat(p);
+    const effFile = rbEffFile(p);
     const hasVst = effKind === 'vst' && !!effVstPath;
     const hasFile = !hasVst && !!effFile;
     const mode = (p.assigned && p.assigned.assigned_mode) || (p._uploaded_file ? 'manual' : '');
@@ -2640,7 +2654,7 @@ async function rbToneEditVst(toneIdx, pIdx) {
         return;
     }
     if (!api) return alert('Native VST hosting not available');
-    const vstPath = piece._vst_path || (piece.assigned && piece.assigned.vst_path) || '';
+    const vstPath = rbEffVstPath(piece);
     if (!vstPath) return alert('This piece has no VST assigned yet.');
     if (rbState._vstEditorBusy) return;   // ignore rapid double-clicks while a load is in flight
     rbState._vstEditorBusy = true;
@@ -2699,7 +2713,7 @@ function rbToneRenderInlineVstParams(toneIdx, pIdx) {
     if (!editor) return;
     const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
     const params = rbFilterVstParams((piece && piece._vst_param_meta) || []);
-    const effVstPath = piece._vst_path || (piece.assigned && piece.assigned.vst_path) || '';
+    const effVstPath = rbEffVstPath(piece);
     const vstName = effVstPath.split('/').pop().replace(/\.(vst3|component)$/i, '');
     const header = `
         <div class="flex items-center justify-between">
@@ -3154,8 +3168,8 @@ function rbRenderMasterPiece(role, idx, p, total) {
     const pendingKind = p._uploaded_kind || p._vst_kind;
     const assignedKind = p.assigned && p.assigned.kind;
     const effKind = pendingKind || assignedKind || 'none';
-    const effVstPath = p._vst_path || (p.assigned && p.assigned.vst_path) || '';
-    const effFile = p._uploaded_file || (p.assigned && p.assigned.file) || null;
+    const effVstPath = rbEffVstPath(p);
+    const effFile = rbEffFile(p);
     let label, labelClass;
     if (effKind === 'vst' && effVstPath) {
         label = `✓ VST: ${effVstPath.split('/').pop()}`;
@@ -3260,16 +3274,16 @@ async function rbPersistMasterChain(role) {
                 rs_gear_type: p.type,
                 kind: 'vst',
                 file: null,
-                vst_path: p._vst_path || (p.assigned && p.assigned.vst_path) || '',
-                vst_format: p._vst_format || (p.assigned && p.assigned.vst_format) || 'VST3',
-                vst_state: p._vst_state ?? (p.assigned && p.assigned.vst_state) ?? null,
+                vst_path: rbEffVstPath(p),
+                vst_format: rbEffVstFormat(p),
+                vst_state: rbEffVstState(p),
                 params: {},
                 assigned_mode: 'master',
                 bypassed: !!p._bypassed,
             };
         }
-        const file = p._uploaded_file || (p.assigned && p.assigned.file) || null;
-        const kindRaw = p._uploaded_kind || (p.assigned && p.assigned.kind) || null;
+        const file = rbEffFile(p);
+        const kindRaw = rbEffKind(p);
         const kind = kindRaw || (file ? (p.rs_category === 'cab' ? 'ir' : 'nam') : 'none');
         return {
             slot: p.slot || `master_${role}`,
@@ -3326,7 +3340,7 @@ async function rbMasterEditVst(role, idx) {
         alert('Native VST hosting not available');
         return;
     }
-    const vstPath = piece._vst_path || (piece.assigned && piece.assigned.vst_path) || '';
+    const vstPath = rbEffVstPath(piece);
     if (!vstPath) {
         alert('This piece has no VST assigned yet — use Assign… first.');
         return;
@@ -4673,8 +4687,8 @@ async function rbScanForVsts(toneIdx, pIdx) {
         const panel = document.getElementById(`rb-vst-panel-${toneIdx}-${pIdx}`);
         if (panel) {
             const piece = rbState.songTones.tones[toneIdx].chain[pIdx];
-            const cur = piece._vst_path || (piece.assigned && piece.assigned.vst_path) || '';
-            const fmt = piece._vst_format || (piece.assigned && piece.assigned.vst_format) || 'VST3';
+            const cur = rbEffVstPath(piece);
+            const fmt = rbEffVstFormat(piece);
             panel.innerHTML = rbRenderVstPanelBody(toneIdx, pIdx, cur, fmt);
         }
     } catch (e) {
@@ -5147,7 +5161,7 @@ async function rbAssignVst(toneIdx, pIdx) {
     piece._vst_kind = 'vst';
     // Capture state (if any) was set by rbCaptureVstState; leave it.
     // Trigger the standard "gear changed" flow so the row re-renders and
-    // any live preview reloads.
+    // any live preview reloads. (Per-song — global propagation was removed.)
     rbAfterGearChange(toneIdx);
     const statusEl = document.getElementById(`rb-vst-status-${toneIdx}-${pIdx}`);
     if (statusEl) statusEl.textContent = `assigned. Click "Save preset" or "Listen" to persist.`;
@@ -5233,16 +5247,16 @@ async function rbPersistTone(toneIdx, filename) {
                 rs_gear_type: p.type,
                 kind: 'vst',
                 file: null,
-                vst_path: p._vst_path || (p.assigned && p.assigned.vst_path) || '',
-                vst_format: p._vst_format || (p.assigned && p.assigned.vst_format) || 'VST3',
-                vst_state: p._vst_state ?? (p.assigned && p.assigned.vst_state) ?? null,
+                vst_path: rbEffVstPath(p),
+                vst_format: rbEffVstFormat(p),
+                vst_state: rbEffVstState(p),
                 params: p.knobs || {},
                 assigned_mode: p._vst_kind ? 'manual_vst' : (p.assigned && p.assigned.assigned_mode) || 'manual_vst',
                 bypassed: !!p._bypassed,
             };
         }
-        const file = p._uploaded_file || (p.assigned && p.assigned.file) || null;
-        const kindRaw = p._uploaded_kind || (p.assigned && p.assigned.kind) || null;
+        const file = rbEffFile(p);
+        const kindRaw = rbEffKind(p);
         const kind = kindRaw || (file ? (p.rs_category === 'cab' ? 'ir' : 'nam') : 'none');
         return {
             slot: p.slot,
@@ -7119,8 +7133,6 @@ async function rbLoadSettings() {
     } catch (e) {
         return;
     }
-    document.getElementById('rb-aggressive').checked = !!s.aggressive;
-    document.getElementById('rb-min-downloads').value = s.min_downloads;
     const megaCb = document.getElementById('rb-mega-chain-mode');
     if (megaCb) megaCb.checked = !!s.mega_chain_mode;
     const bac = document.getElementById('rb-bypass-all-cabs');
@@ -7201,8 +7213,6 @@ async function rbOauthDisconnect() {
 }
 
 async function rbSaveSettings() {
-    const aggressive = document.getElementById('rb-aggressive').checked;
-    const min_downloads = parseInt(document.getElementById('rb-min-downloads').value, 10) || 0;
     const megaCb = document.getElementById('rb-mega-chain-mode');
     const mega_chain_mode = megaCb ? !!megaCb.checked : false;
     const bac = document.getElementById('rb-bypass-all-cabs');
@@ -7210,7 +7220,7 @@ async function rbSaveSettings() {
     await fetch(`${RB_API}/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ aggressive, min_downloads, mega_chain_mode, bypass_all_cabs }),
+        body: JSON.stringify({ mega_chain_mode, bypass_all_cabs }),
     });
     // Mirror to the runtime so RbMegaChain picks it up without a restart.
     window.__rbMegaChainSetting = mega_chain_mode;
