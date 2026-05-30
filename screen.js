@@ -197,7 +197,7 @@ function rbChainGainTargetFor(chainSpec) {
     // User "Chain volume" trim (chain_makeup, default 1.0) — the ONLY level
     // the engine respects (per-stage IR gain is ignored). Multiplies the
     // auto-leveled base below.
-    const makeup = (typeof window.__rbChainMakeup === 'number') ? window.__rbChainMakeup : 1.0;
+    const makeup = (typeof window.__rbChainMakeup === 'number') ? window.__rbChainMakeup : 4.0;
     let base = 1.0;
     if (Array.isArray(chainSpec)) {
         let hasActiveAmp = false, hasActiveCab = false, activeNamCount = 0;
@@ -7171,8 +7171,8 @@ async function rbLoadSettings() {
     if (typeof s.nam_chain_input_drive === 'number') {
         window.__rbChainInputDrive = s.nam_chain_input_drive;
     }
-    // Chain volume trim (user cab/chain makeup). Default 1.0.
-    window.__rbChainMakeup = (typeof s.chain_makeup === 'number') ? s.chain_makeup : 1.0;
+    // Chain volume trim (user cab/chain makeup). Default 4.0.
+    window.__rbChainMakeup = (typeof s.chain_makeup === 'number') ? s.chain_makeup : 4.0;
     const cmSlider = document.getElementById('rb-chain-makeup');
     const cmVal = document.getElementById('rb-chain-makeup-val');
     if (cmSlider) cmSlider.value = String(window.__rbChainMakeup);

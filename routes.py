@@ -5048,6 +5048,9 @@ def setup(app, context):
             # at every chain load — value of 8.0 = +18 dB feeds NAM amps
             # at capture-time levels so they actually saturate.
             "nam_chain_input_drive": float(s.get("nam_chain_input_drive", 8.0)),
+            # User "Chain volume" trim (setGain('chain') multiplier). Default 4×
+            # — the guitar chain runs much quieter than the backing track.
+            "chain_makeup": float(s.get("chain_makeup", 4.0)),
             "has_tone3000_key": bool(key),
             "tone3000_api_key_preview": (key[:6] + "…") if key else "",
             "tone3000_connected": bool(s.get("tone3000_access_token")),
